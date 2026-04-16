@@ -42,7 +42,8 @@ bookingRouter.post('/login', async (req: Request, res: Response) => {
 
     // 2FA 인증 필요 여부 확인
     if (currentUrl.includes('nid.naver.com/login/sso') || currentUrl.includes('naver.com/nidlogin')) {
-      const screenshot = await page.screenshot({ encoding: 'base64' });
+      const screenshotBuf = await page.screenshot();
+      const screenshot = screenshotBuf.toString('base64');
       await browser.close();
       return res.json({
         success: false,
@@ -65,7 +66,8 @@ bookingRouter.post('/login', async (req: Request, res: Response) => {
     }
 
     // 로그인 실패
-    const screenshot = await page.screenshot({ encoding: 'base64' });
+    const screenshotBuf2 = await page.screenshot();
+    const screenshot = screenshotBuf2.toString('base64');
     await browser.close();
     return res.json({
       success: false,
@@ -125,7 +127,8 @@ bookingRouter.post('/availability', async (req: Request, res: Response) => {
     }
 
     // 스크린샷 캡처
-    const screenshot = await page.screenshot({ encoding: 'base64', fullPage: false });
+    const screenshotBuf3 = await page.screenshot({ fullPage: false });
+    const screenshot = screenshotBuf3.toString('base64');
 
     // 현재 URL 저장 (예약 페이지)
     const bookingUrl = page.url();
@@ -245,7 +248,8 @@ bookingRouter.post('/fill-form', async (req: Request, res: Response) => {
     await page.waitForTimeout(1000);
 
     // 결제 직전 스크린샷
-    const screenshot = await page.screenshot({ encoding: 'base64', fullPage: false });
+    const screenshotBuf3 = await page.screenshot({ fullPage: false });
+    const screenshot = screenshotBuf3.toString('base64');
     const finalUrl = page.url();
 
     await browser.close();
