@@ -25,36 +25,74 @@ bookingRouter.post('/login', async (req: Request, res: Response) => {
     });
     const page = await context.newPage();
 
-    // 네이버 로그인 페이지
     await page.goto('https://nid.naver.com/nidlogin.login', { waitUntil: 'networkidle' });
 
-    // 아이디/비밀번호 입력 (자연스러운 타이핑)
     await page.click('#id');
     await page.keyboard.type(naverID, { delay: 80 });
     await page.click('#pw');
     await page.keyboard.type(naverPW, { delay: 80 });
     await page.click('.btn_login');
 
-    // 로그인 결과 대기
     await page.waitForTimeout(3000);
 
     const currentUrl = page.url();
 
-    // 2FA 인증 필요 여부 확인
-    if (currentUrl.includes('nid.naver.com/login/sso') || currentUrl.includes('naver.com/nidlogin')) {
-      const screenshotBuf = await page.screenshot();
-      const screenshot = screenshotBuf.toString('base64');
+    // ── 캡차 감지: 로그인 페이지에 머물러 있으면 캡차 또는 오류 ──
+    if (currentUrl.includes('nidlogin') || currentUrl.includes('nid.naver.com/login')) {
+      // 캡차 이미지 존재 여부 확인
+      const captchaImg = page.locator('img[src*="captcha"], .captcha_area img, #captchaimg').first();
+      const hasCaptcha = await captchaImg.count() > 0;
+
+      // 오류 메시지 확인
+      const errorMsg = await page.locator('.error_message, .msg, [class*="error"]').first().textContent().catch(() => '');
+
+      const screenshotBuf = await page.screenshot({ fullPage: false });
+      const screenshot = `data:image/png;base64,${screenshotBuf.toString('base64')}`;
+
+      if (hasCaptcha) {
+        // 캡차 이미지 URL 추출
+        const captchaSrc = await captchaImg.getAttribute('src').catch(() => '');
+        // 브라우저를 닫지 않고 pending 세션으로 저장
+        const pendingId = sessionStore.createPending(naverID, browser, context, page);
+        return res.json({
+          success: false,
+          needVerification: true,
+          verificationType: 'captcha',
+          pendingSessionId: pendingId,
+          message: '네이버 로그인 중 자동입력 방지 문자가 표시되었습니다. 화면에 보이는 문자를 말씀해 주세요.',
+          screenshot,
+          captchaSrc,
+        });
+      }
+
+      // 2단계 인증 (SMS/앱 인증)
+      const is2FA = currentUrl.includes('sso') || currentUrl.includes('2fa') ||
+        await page.locator('input[name*="otp"], input[placeholder*="인증"], .otp_area').count() > 0;
+
+      if (is2FA) {
+        const pendingId = sessionStore.createPending(naverID, browser, context, page);
+        return res.json({
+          success: false,
+          needVerification: true,
+          verificationType: 'otp',
+          pendingSessionId: pendingId,
+          message: '네이버에서 추가 인증이 필요합니다. 휴대폰으로 받은 인증번호를 말씀해 주세요.',
+          screenshot,
+        });
+      }
+
+      // 비밀번호 오류 또는 기타 오류
       await browser.close();
       return res.json({
         success: false,
-        needVerification: true,
-        message: '네이버에서 추가 인증이 필요합니다. 휴대폰으로 받은 인증번호를 입력해주세요.',
-        screenshot: `data:image/png;base64,${screenshot}`,
+        needVerification: false,
+        message: errorMsg || '아이디 또는 비밀번호가 올바르지 않습니다.',
+        screenshot,
       });
     }
 
-    // 로그인 성공 확인
-    if (currentUrl.includes('naver.com') && !currentUrl.includes('nidlogin')) {
+    // ── 로그인 성공 ──
+    if (currentUrl.includes('naver.com')) {
       const cookies = await context.cookies();
       const sessionId = sessionStore.create(naverID, cookies);
       await browser.close();
@@ -65,18 +103,105 @@ bookingRouter.post('/login', async (req: Request, res: Response) => {
       });
     }
 
-    // 로그인 실패
+    // 알 수 없는 상태
     const screenshotBuf2 = await page.screenshot();
-    const screenshot = screenshotBuf2.toString('base64');
     await browser.close();
     return res.json({
       success: false,
-      message: '아이디 또는 비밀번호가 올바르지 않습니다.',
-      screenshot: `data:image/png;base64,${screenshot}`,
+      message: '로그인 처리 중 알 수 없는 오류가 발생했습니다.',
+      screenshot: `data:image/png;base64,${screenshotBuf2.toString('base64')}`,
     });
 
   } catch (err: any) {
-    await browser.close();
+    await browser.close().catch(() => {});
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── 1-b. 캡차/OTP 인증번호 제출 ──────────────────────────────
+bookingRouter.post('/submit-verification', async (req: Request, res: Response) => {
+  const { pendingSessionId, code, naverID } = req.body;
+
+  if (!pendingSessionId || !code) {
+    return res.status(400).json({ error: 'pendingSessionId와 code가 필요합니다.' });
+  }
+
+  const pending = sessionStore.getPending(pendingSessionId);
+  if (!pending) {
+    return res.status(404).json({ error: '인증 세션이 만료되었습니다. 다시 로그인해주세요.' });
+  }
+
+  const { browser, context, page } = pending;
+
+  try {
+    // 캡차 입력 필드 찾기
+    const captchaInput = page.locator(
+      'input[name*="captcha"], input[id*="captcha"], input[placeholder*="문자"], .captcha_area input'
+    ).first();
+
+    const otpInput = page.locator(
+      'input[name*="otp"], input[name*="code"], input[placeholder*="인증"], input[type="number"][maxlength]'
+    ).first();
+
+    if (await captchaInput.count() > 0) {
+      await captchaInput.fill('');
+      await captchaInput.type(code, { delay: 60 });
+    } else if (await otpInput.count() > 0) {
+      await otpInput.fill('');
+      await otpInput.type(code, { delay: 60 });
+    } else {
+      // 현재 화면에 입력 가능한 필드가 없음 → 스크린샷 반환
+      const ss = await page.screenshot();
+      return res.json({
+        success: false,
+        message: '인증 입력 필드를 찾지 못했습니다. 다시 시도해주세요.',
+        screenshot: `data:image/png;base64,${ss.toString('base64')}`,
+      });
+    }
+
+    // 확인/로그인 버튼 클릭
+    const confirmBtn = page.locator(
+      'button:has-text("확인"), button:has-text("로그인"), button[type="submit"], .btn_login, .btn_confirm'
+    ).first();
+    if (await confirmBtn.count() > 0) {
+      await confirmBtn.click();
+    } else {
+      await page.keyboard.press('Enter');
+    }
+
+    await page.waitForTimeout(3000);
+    const currentUrl = page.url();
+
+    // 로그인 성공 확인
+    if (currentUrl.includes('naver.com') && !currentUrl.includes('nidlogin') && !currentUrl.includes('nid.naver.com/login')) {
+      const cookies = await context.cookies();
+      const userId = pending.userId || naverID || 'user';
+      const sessionId = sessionStore.create(userId, cookies);
+      sessionStore.deletePending(pendingSessionId);
+      await browser.close();
+      return res.json({
+        success: true,
+        sessionId,
+        message: '인증 완료! 네이버 로그인 성공',
+      });
+    }
+
+    // 아직 인증 화면에 있음 → 재시도 필요
+    const screenshotBuf = await page.screenshot();
+    const screenshot = `data:image/png;base64,${screenshotBuf.toString('base64')}`;
+    const errorMsg = await page.locator('.error_message, .msg, [class*="error"]').first().textContent().catch(() => '');
+
+    return res.json({
+      success: false,
+      needVerification: true,
+      pendingSessionId,
+      message: errorMsg || '인증번호가 올바르지 않습니다. 다시 입력해주세요.',
+      screenshot,
+    });
+
+  } catch (err: any) {
+    await browser.close().catch(() => {});
+    sessionStore.deletePending(pendingSessionId);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -101,54 +226,43 @@ bookingRouter.post('/availability', async (req: Request, res: Response) => {
       viewport: { width: 1280, height: 800 },
     });
 
-    // 저장된 쿠키로 로그인 상태 복원
     await context.addCookies(session.cookies);
     const page = await context.newPage();
 
-    // 네이버 지도에서 업체 검색
     await page.goto(`https://map.naver.com/p/search/${encodeURIComponent(businessName)}`, {
       waitUntil: 'networkidle',
       timeout: 15000,
     });
     await page.waitForTimeout(2000);
 
-    // 첫 번째 검색 결과 클릭
     const firstResult = page.locator('.place_bluelink, .CHC5F, a[class*="place"]').first();
     if (await firstResult.count() > 0) {
       await firstResult.click();
       await page.waitForTimeout(2000);
     }
 
-    // 예약 탭 찾기
     const bookingTab = page.locator('a:has-text("예약"), button:has-text("예약"), span:has-text("예약")').first();
     if (await bookingTab.count() > 0) {
       await bookingTab.click();
       await page.waitForTimeout(2000);
     }
 
-    // 스크린샷 캡처
-    const screenshotBuf3 = await page.screenshot({ fullPage: false });
-    const screenshot = screenshotBuf3.toString('base64');
-
-    // 현재 URL 저장 (예약 페이지)
+    const screenshotBuf = await page.screenshot({ fullPage: false });
+    const screenshot = screenshotBuf.toString('base64');
     const bookingUrl = page.url();
 
-    // 날짜별 예약 가능 시간 파싱 시도
     const availableSlots: string[] = [];
 
-    // 달력에서 해당 날짜 찾기
     if (date) {
       const dateObj = new Date(date);
       const day = dateObj.getDate();
 
-      // 날짜 클릭 시도
       const dateCell = page.locator(`[aria-label*="${day}일"], td:has-text("${day}"), .calendar-day:has-text("${day}")`).first();
       if (await dateCell.count() > 0) {
         await dateCell.click();
         await page.waitForTimeout(1500);
       }
 
-      // 시간 슬롯 파싱
       const timeSlots = await page.locator(
         '.time-slot, [class*="time"], button:has-text("시"), .booking-time'
       ).allTextContents();
@@ -173,7 +287,7 @@ bookingRouter.post('/availability', async (req: Request, res: Response) => {
     });
 
   } catch (err: any) {
-    await browser.close();
+    await browser.close().catch(() => {});
     return res.status(500).json({ error: err.message });
   }
 });
@@ -204,7 +318,6 @@ bookingRouter.post('/fill-form', async (req: Request, res: Response) => {
     await page.goto(bookingUrl, { waitUntil: 'networkidle', timeout: 15000 });
     await page.waitForTimeout(2000);
 
-    // 날짜 선택
     if (date) {
       const dateObj = new Date(date);
       const day = dateObj.getDate();
@@ -215,7 +328,6 @@ bookingRouter.post('/fill-form', async (req: Request, res: Response) => {
       }
     }
 
-    // 시간 선택
     if (selectedTime) {
       const timeBtn = page.locator(`button:has-text("${selectedTime}"), [data-time="${selectedTime}"]`).first();
       if (await timeBtn.count() > 0) {
@@ -224,21 +336,18 @@ bookingRouter.post('/fill-form', async (req: Request, res: Response) => {
       }
     }
 
-    // 다음 버튼 클릭
     const nextBtn = page.locator('button:has-text("다음"), button:has-text("예약하기")').first();
     if (await nextBtn.count() > 0) {
       await nextBtn.click();
       await page.waitForTimeout(1500);
     }
 
-    // 이름 입력
     const nameInput = page.locator('input[placeholder*="이름"], input[name*="name"], input[id*="name"]').first();
     if (await nameInput.count() > 0) {
       await nameInput.fill('');
       await nameInput.type(userName, { delay: 60 });
     }
 
-    // 전화번호 입력
     const phoneInput = page.locator('input[placeholder*="전화"], input[placeholder*="연락처"], input[type="tel"]').first();
     if (await phoneInput.count() > 0) {
       await phoneInput.fill('');
@@ -247,9 +356,8 @@ bookingRouter.post('/fill-form', async (req: Request, res: Response) => {
 
     await page.waitForTimeout(1000);
 
-    // 결제 직전 스크린샷
-    const screenshotBuf3 = await page.screenshot({ fullPage: false });
-    const screenshot = screenshotBuf3.toString('base64');
+    const screenshotBuf = await page.screenshot({ fullPage: false });
+    const screenshot = screenshotBuf.toString('base64');
     const finalUrl = page.url();
 
     await browser.close();
@@ -262,7 +370,7 @@ bookingRouter.post('/fill-form', async (req: Request, res: Response) => {
     });
 
   } catch (err: any) {
-    await browser.close();
+    await browser.close().catch(() => {});
     return res.status(500).json({ error: err.message });
   }
 });
