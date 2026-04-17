@@ -89,8 +89,7 @@ bookingRouter.post('/login', async (req: Request, res: Response) => {
         await page.locator('input[name*="otp"], input[placeholder*="인증"], .otp_area').count() > 0;
 
       if (is2FA) {
-        const { sessionStore: ss } = await import('../session-store');
-        const pendingId = ss.createPending(naverID, browser, context, page);
+        const pendingId = sessionStore.createPending(naverID, browser, context, page);
         return res.json({
           success: false,
           needVerification: true,
@@ -221,10 +220,8 @@ bookingRouter.post('/submit-verification', async (req: Request, res: Response) =
 bookingRouter.post('/availability', async (req: Request, res: Response) => {
   const { sessionId, businessName, date } = req.body;
 
-  const session = sessionStore.get(sessionId);
-  if (!session) {
-    return res.status(401).json({ error: '로그인이 필요합니다.' });
-  }
+  const session = sessionId ? sessionStore.get(sessionId) : null;
+  // 비로그인(guest) 상태로도 조회 허용 - 쿠키 없이 진행
 
   const browser = await chromium.launch({
     headless: true,
@@ -236,8 +233,8 @@ bookingRouter.post('/availability', async (req: Request, res: Response) => {
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     });
 
-    // 저장된 쿠키 복원
-    await context.addCookies(session.cookies);
+    // 저장된 쿠키 복원 (로그인 세션이 있는 경우만)
+    if (session) await context.addCookies(session.cookies);
     const page = await context.newPage();
 
     // 네이버 예약 검색
@@ -297,10 +294,8 @@ bookingRouter.post('/availability', async (req: Request, res: Response) => {
 bookingRouter.post('/fill-form', async (req: Request, res: Response) => {
   const { sessionId, bookingUrl, userName, userPhone, selectedTime, date } = req.body;
 
-  const session = sessionStore.get(sessionId);
-  if (!session) {
-    return res.status(401).json({ error: '로그인이 필요합니다.' });
-  }
+  const session = sessionId ? sessionStore.get(sessionId) : null;
+  // 비로그인 상태로도 폼 입력 시도 허용 (쿠키 없이 진행)
 
   const browser = await chromium.launch({
     headless: true,
@@ -312,7 +307,7 @@ bookingRouter.post('/fill-form', async (req: Request, res: Response) => {
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     });
 
-    await context.addCookies(session.cookies);
+    if (session) await context.addCookies(session.cookies);
     const page = await context.newPage();
 
     const targetUrl = bookingUrl || `https://booking.naver.com/`;
@@ -376,6 +371,39 @@ bookingRouter.post('/fill-form', async (req: Request, res: Response) => {
 
   } catch (err: any) {
     await browser.close().catch(() => {});
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── 4. 예약 완료 이메일 알림 ────────────────────────────────────
+bookingRouter.post('/notify', async (req: Request, res: Response) => {
+  const { email, businessName, date, time, userName } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: '이메일 주소가 필요합니다.' });
+  }
+
+  try {
+    await sendEmailNotification({
+      to: email,
+      subject: `[JARVIS] ${businessName} 예약 완료 알림`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2 style="color: #C8A96E;">MAWINPAY JARVIS 예약 완료</h2>
+          <p>안녕하세요, ${userName || '선생님'}.</p>
+          <p>아래 예약이 완료되었습니다:</p>
+          <table style="border-collapse: collapse; width: 100%;">
+            <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>업체명</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${businessName}</td></tr>
+            <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>날짜</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${date}</td></tr>
+            <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>시간</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${time}</td></tr>
+            <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>예약자</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${userName}</td></tr>
+          </table>
+          <p style="color: #888; font-size: 12px; margin-top: 20px;">이 메일은 MAWINPAY JARVIS 시스템에서 자동 발송되었습니다.</p>
+        </div>
+      `,
+    });
+    return res.json({ success: true, message: '이메일 알림이 발송되었습니다.' });
+  } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
 });
