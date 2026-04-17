@@ -5,6 +5,140 @@ import { sendEmailNotification } from '../email';
 
 export const bookingRouter = Router();
 
+// ── 0. 스크린샷 스트리밍 방식 수동 로그인 ──
+// 서버에서 headless Playwright로 네이버 로그인 페이지를 열고,
+// 스크린샷을 polling으로 프론트에 전달. 프론트에서 클릭/타이핑 이벤트를 서버로 전달.
+interface ManualSession {
+  browser: any;
+  context: any;
+  page: any;
+  resolved: boolean;
+  userId: string;
+  createdAt: number;
+}
+const manualLoginSessions = new Map<string, ManualSession>();
+const completedManualLogins = new Map<string, string>(); // pendingId -> sessionId
+
+// 세션 시작
+bookingRouter.post('/manual-login/start', async (req: Request, res: Response) => {
+  const { naverID } = req.body;
+  const pendingId = require('crypto').randomUUID();
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    viewport: { width: 480, height: 700 },
+  });
+  const page = await context.newPage();
+  await page.goto('https://nid.naver.com/nidlogin.login', { waitUntil: 'networkidle' });
+
+  if (naverID) {
+    await page.click('#id').catch(() => {});
+    await page.keyboard.type(naverID, { delay: 50 }).catch(() => {});
+  }
+
+  const session: ManualSession = { browser, context, page, resolved: false, userId: naverID || 'user', createdAt: Date.now() };
+  manualLoginSessions.set(pendingId, session);
+
+  // 로그인 완료 자동 감지
+  const checkInterval = setInterval(async () => {
+    try {
+      const s = manualLoginSessions.get(pendingId);
+      if (!s || s.resolved) { clearInterval(checkInterval); return; }
+      const url = s.page.url();
+      if (!url.includes('nidlogin') && !url.includes('nid.naver.com/login') && url.includes('naver.com')) {
+        s.resolved = true;
+        clearInterval(checkInterval);
+        const cookies = await s.context.cookies();
+        const savedId = sessionStore.create(s.userId, cookies);
+        completedManualLogins.set(pendingId, savedId);
+        await s.browser.close();
+        manualLoginSessions.delete(pendingId);
+      }
+    } catch {}
+  }, 1500);
+
+  // 10분 타임아웃
+  setTimeout(() => {
+    const s = manualLoginSessions.get(pendingId);
+    if (s && !s.resolved) {
+      clearInterval(checkInterval);
+      s.browser.close().catch(() => {});
+      manualLoginSessions.delete(pendingId);
+    }
+  }, 10 * 60 * 1000);
+
+  return res.json({ success: true, pendingId, message: '서버에서 로그인 브라우저가 시작되었습니다.' });
+});
+
+// 스크린샷 가져오기 (polling)
+bookingRouter.get('/manual-login/screenshot/:pendingId', async (req: Request, res: Response) => {
+  const { pendingId } = req.params;
+  const s = manualLoginSessions.get(pendingId);
+  if (!s) return res.status(404).json({ error: '세션 없음' });
+  try {
+    const buf = await s.page.screenshot({ fullPage: false });
+    const screenshot = `data:image/png;base64,${buf.toString('base64')}`;
+    const url = s.page.url();
+    return res.json({ success: true, screenshot, url, resolved: s.resolved });
+  } catch (e) {
+    return res.status(500).json({ error: '스크린샷 실패' });
+  }
+});
+
+// 클릭 이벤트 전달
+bookingRouter.post('/manual-login/click/:pendingId', async (req: Request, res: Response) => {
+  const { pendingId } = req.params;
+  const { x, y } = req.body;
+  const s = manualLoginSessions.get(pendingId);
+  if (!s) return res.status(404).json({ error: '세션 없음' });
+  try {
+    await s.page.mouse.click(x, y);
+    return res.json({ success: true });
+  } catch (e) {
+    return res.status(500).json({ error: '클릭 실패' });
+  }
+});
+
+// 타이핑 이벤트 전달
+bookingRouter.post('/manual-login/type/:pendingId', async (req: Request, res: Response) => {
+  const { pendingId } = req.params;
+  const { text, key } = req.body;
+  const s = manualLoginSessions.get(pendingId);
+  if (!s) return res.status(404).json({ error: '세션 없음' });
+  try {
+    if (key) await s.page.keyboard.press(key);
+    else if (text) await s.page.keyboard.type(text, { delay: 30 });
+    return res.json({ success: true });
+  } catch (e) {
+    return res.status(500).json({ error: '타이핑 실패' });
+  }
+});
+
+// 완료 여부 확인 (polling)
+bookingRouter.get('/manual-login/status/:pendingId', (req: Request, res: Response) => {
+  const { pendingId } = req.params;
+  const sessionId = completedManualLogins.get(pendingId);
+  if (sessionId) {
+    completedManualLogins.delete(pendingId);
+    return res.json({ success: true, sessionId, message: '네이버 로그인 완료' });
+  }
+  return res.json({ success: false, pending: true });
+});
+
+// ── 0-b. 쿠키 직접 저장 (프론트에서 쿠키 배열 전송) ──
+bookingRouter.post('/save-cookies', (req: Request, res: Response) => {
+  const { naverID, cookies } = req.body;
+  if (!cookies || !Array.isArray(cookies)) {
+    return res.status(400).json({ error: '쿠키 배열이 필요합니다.' });
+  }
+  const sessionId = sessionStore.create(naverID || 'user', cookies);
+  return res.json({ success: true, sessionId });
+});
+
 // ── 1. 네이버 로그인 (stateless: captchaAnswer 포함 재시도 방식) ──────────────
 bookingRouter.post('/login', async (req: Request, res: Response) => {
   const { naverID, naverPW, captchaAnswer } = req.body;
