@@ -118,6 +118,34 @@ bookingRouter.post('/manual-login/type/:pendingId', async (req: Request, res: Re
   }
 });
 
+// 비밀번호 자동 입력 + 로그인 버튼 클릭 (원터치)
+bookingRouter.post('/manual-login/fill-password/:pendingId', async (req: Request, res: Response) => {
+  const { pendingId } = req.params;
+  const { password } = req.body;
+  const s = manualLoginSessions.get(pendingId);
+  if (!s) return res.status(404).json({ error: '세션 없음' });
+  try {
+    // 비밀번호 필드 선택자로 직접 클릭 후 입력
+    await s.page.click('input[type="password"], #pw, input[name="password"]').catch(async () => {
+      // 선택자 실패 시 좌표로 클릭 (비밀번호 필드 위치 추정)
+      await s.page.mouse.click(240, 350);
+    });
+    await s.page.waitForTimeout(300);
+    // 기존 내용 지우고 새로 입력
+    await s.page.keyboard.press('Control+A');
+    await s.page.keyboard.press('Backspace');
+    await s.page.keyboard.type(password, { delay: 40 });
+    await s.page.waitForTimeout(300);
+    // 로그인 버튼 클릭
+    await s.page.click('button[type="submit"], .btn_login, #log\.login, button:has-text("로그인")').catch(async () => {
+      await s.page.keyboard.press('Enter');
+    });
+    return res.json({ success: true, message: '비밀번호 입력 및 로그인 시도 완료' });
+  } catch (e) {
+    return res.status(500).json({ error: `자동 입력 실패: ${String(e)}` });
+  }
+});
+
 // 완료 여부 확인 (polling)
 bookingRouter.get('/manual-login/status/:pendingId', (req: Request, res: Response) => {
   const { pendingId } = req.params;
