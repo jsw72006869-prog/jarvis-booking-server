@@ -580,3 +580,104 @@ bookingRouter.post('/notify', async (req: Request, res: Response) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+// ── 네이버 지역 검색 API - 병원/업체 추천 ──
+bookingRouter.post('/search-local', async (req: Request, res: Response) => {
+  const { query, display = 5, sort = 'comment' } = req.body;
+  // sort: 'comment' (리뷰순), 'random' (관련도순)
+
+  if (!query) {
+    return res.status(400).json({ error: 'query 파라미터가 필요합니다.' });
+  }
+
+  const clientId = process.env.NAVER_CLIENT_ID;
+  const clientSecret = process.env.NAVER_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    // 네이버 API 키 없으면 Playwright로 직접 스크래핑
+    try {
+      const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+      const context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      });
+      const page = await context.newPage();
+
+      const searchUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(query)}&where=place`;
+      await page.goto(searchUrl, { waitUntil: 'networkidle', timeout: 20000 });
+
+      // 업체 목록 추출
+      const places = await page.evaluate('(function() { var items = []; var listItems = document.querySelectorAll(\'li.place_bluelink, .UEzoS, [class*=\'place_item\'], .TYaxT\'); listItems.forEach(function(el, idx) { if (idx >= 10) return; var name = (el.querySelector(\'.place_bluelink, .YwYLL, .TYaxT\') || {textContent:\'\'}).textContent.trim(); var category = (el.querySelector(\'.KCMnt\') || {textContent:\'\'}).textContent.trim(); var address = (el.querySelector(\'.LDgIH\') || {textContent:\'\'}).textContent.trim(); var reviewCount = (el.querySelector(\'.h69bs\') || {textContent:\'\'}).textContent.trim(); var rating = (el.querySelector(\'.orXYY\') || {textContent:\'\'}).textContent.trim(); var phone = (el.querySelector(\'.xlx3J\') || {textContent:\'\'}).textContent.trim(); if (name) items.push({name:name,category:category,address:address,reviewCount:reviewCount,rating:rating,phone:phone}); }); return items; })()') as any[];
+
+      await browser.close();
+
+      if (places.length === 0) {
+        // 스크래핑 실패 시 기본 응답
+        return res.json({
+          success: true,
+          query,
+          items: [],
+          message: '검색 결과를 가져오지 못했습니다. 네이버 API 키를 설정하면 더 정확한 결과를 제공합니다.',
+        });
+      }
+
+      return res.json({ success: true, query, items: places, source: 'scraping' });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // 네이버 지역 검색 API 사용
+  try {
+    const apiUrl = `https://openapi.naver.com/v1/search/local.json?query=${encodeURIComponent(query)}&display=${display}&sort=${sort}`;
+    const response = await fetch(apiUrl, {
+      headers: {
+        'X-Naver-Client-Id': clientId,
+        'X-Naver-Client-Secret': clientSecret,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`네이버 API 오류: ${response.status}`);
+    }
+
+    const data: any = await response.json();
+    const items = (data.items || []).map((item: any) => ({
+      name: item.title?.replace(/<[^>]+>/g, '') || '',
+      category: item.category || '',
+      address: item.roadAddress || item.address || '',
+      telephone: item.telephone || '',
+      link: item.link || '',
+      mapx: item.mapx,
+      mapy: item.mapy,
+    }));
+
+    return res.json({ success: true, query, total: data.total, items, source: 'naver_api' });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── 네이버 플레이스 상세 정보 (리뷰, 방문자 수 등) ──
+bookingRouter.post('/place-detail', async (req: Request, res: Response) => {
+  const { placeName, placeAddress } = req.body;
+  if (!placeName) return res.status(400).json({ error: 'placeName이 필요합니다.' });
+
+  try {
+    const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    });
+    const page = await context.newPage();
+
+    const searchQuery = placeAddress ? `${placeName} ${placeAddress}` : placeName;
+    const searchUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(searchQuery)}&where=place`;
+    await page.goto(searchUrl, { waitUntil: 'networkidle', timeout: 20000 });
+
+      const detail = await page.evaluate('(function() { var firstItem = document.querySelector(\'.UEzoS\') || document.querySelector(\'li.place_bluelink\'); if (!firstItem) return null; var rating = (firstItem.querySelector(\'.orXYY\') || {textContent:\'\'}).textContent.trim(); var reviewCount = (firstItem.querySelector(\'.h69bs\') || {textContent:\'\'}).textContent.trim(); return { rating: rating, reviewCount: reviewCount }; })()') as any;
+
+    await browser.close();
+    return res.json({ success: true, detail });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});

@@ -27,6 +27,17 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
+// 서버 외부 IP 확인 (스마트스토어 API IP 등록용)
+app.get('/my-ip', async (req, res) => {
+  try {
+    const response = await fetch('https://api.ipify.org?format=json');
+    const data = await response.json() as { ip: string };
+    res.json({ ip: data.ip, message: '스마트스토어 API 호출 IP 등록 시 이 IP를 사용하세요' });
+  } catch (e) {
+    res.json({ ip: 'unknown', error: String(e) });
+  }
+});
+
 // 예약 라우터
 app.use('/api/booking', bookingRouter);
 
