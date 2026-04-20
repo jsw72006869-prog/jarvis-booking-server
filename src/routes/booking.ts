@@ -222,15 +222,26 @@ bookingRouter.post('/login', async (req: Request, res: Response) => {
       const screenshot = `data:image/png;base64,${screenshotBuf.toString('base64')}`;
 
       if (hasCaptcha) {
-        // 캡차 이미지를 직접 스크린샷으로 캡처 (URL 방식은 CORS 차단됨)
-        let captchaSrc = screenshot;
+        // 캡차 전체 영역(질문 + 이미지) 스크린샷 캡처
+        // captchaImgEl.screenshot()은 이미지만 캡처해서 질문 텍스트가 잘림
+        // 대신 캡차 컨테이너 전체를 캡처하거나, 전체 화면 사용
+        let captchaSrc = screenshot; // 기본값: 전체 화면 스크린샷
         try {
-          const captchaBuf = await captchaImgEl.screenshot().catch(() => null);
-          if (captchaBuf) {
-            captchaSrc = `data:image/png;base64,${captchaBuf.toString('base64')}`;
+          // 캡차 컨테이너 전체 영역 시도 (질문 + 이미지 포함)
+          const captchaContainerEl = page.locator(
+            '.captcha_area, #captcha_area, .login_captcha, .captcha_wrap, [class*="captcha"]'
+          ).first();
+          const hasContainer = await captchaContainerEl.count() > 0;
+          if (hasContainer) {
+            const containerBuf = await captchaContainerEl.screenshot().catch(() => null);
+            if (containerBuf) {
+              captchaSrc = `data:image/png;base64,${containerBuf.toString('base64')}`;
+            }
+            // 컨테이너 캡처 실패 시 전체 화면 사용 (captchaSrc = screenshot 유지)
           }
+          // 컨테이너 없으면 전체 화면 사용 (captchaSrc = screenshot 유지)
         } catch (e) {
-          // 캡차 요소 스크린샷 실패 시 전체 화면 사용
+          // 오류 시 전체 화면 사용 (captchaSrc = screenshot 유지)
         }
         // 브라우저 닫기 (stateless: 상태 저장 불필요)
         await browser.close();
