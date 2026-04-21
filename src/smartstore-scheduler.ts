@@ -114,20 +114,26 @@ export async function runDailyOrderReport() {
     const yesterday = new Date(kstNow);
     yesterday.setDate(yesterday.getDate() - 1);
     const yesterdayKST = yesterday.toISOString().split('T')[0];
-    const [newOrderCount, dispatchCount, deliveringCount, confirmedCount, settlement] = await Promise.all([
-      getOrderCountByStatus(token, ['PAYED'], yesterdayKST, todayKST),
-      getOrderCountByStatus(token, ['DELIVERING_HOLD'], yesterdayKST, todayKST),
-      getOrderCountByStatus(token, ['DELIVERING'], yesterdayKST, todayKST),
-      getOrderCountByStatus(token, ['PURCHASE_DECIDED'], yesterdayKST, todayKST),
+    // 누적 현황 조회를 위해 30일 범위 사용
+    const thirtyDaysAgo = new Date(kstNow);
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const thirtyDaysAgoKST = thirtyDaysAgo.toISOString().split('T')[0];
+    const [newOrderCount, dispatchCount, deliveringCount, deliveredCount, confirmedCount, settlement] = await Promise.all([
+      getOrderCountByStatus(token, ['PAYED'], thirtyDaysAgoKST, todayKST),
+      getOrderCountByStatus(token, ['DELIVERING_HOLD'], thirtyDaysAgoKST, todayKST),
+      getOrderCountByStatus(token, ['DELIVERING'], thirtyDaysAgoKST, todayKST),
+      getOrderCountByStatus(token, ['DELIVERED'], thirtyDaysAgoKST, todayKST),
+      getOrderCountByStatus(token, ['PURCHASE_DECIDED'], thirtyDaysAgoKST, todayKST),
       getDailySettlement(token, yesterdayKST),
     ]);
     let newOrders = [];
-    if (newOrderCount > 0) newOrders = await getNewOrderDetails(token, yesterdayKST, todayKST);
+    if (newOrderCount > 0) newOrders = await getNewOrderDetails(token, thirtyDaysAgoKST, todayKST);
     let message = '📊 <b>[자동 보고] ' + yesterdayKST + ' 현황</b>\n';
     message += '━━━━━━━━━━━━━━━\n';
     message += '🆕 신규 주문: <b>' + newOrderCount + '건</b>\n';
-    message += '📦 발주 현황: <b>' + dispatchCount + '건</b>\n';
-    message += '🚚 배송 현황: <b>' + deliveringCount + '건</b>\n';
+    message += '📦 배송 준비: <b>' + dispatchCount + '건</b>\n';
+    message += '🚚 배송 중: <b>' + deliveringCount + '건</b>\n';
+    message += '📬 배송 완료: <b>' + deliveredCount + '건</b>\n';
     message += '✅ 구매 확정: <b>' + confirmedCount + '건</b>\n';
     message += '━━━━━━━━━━━━━━━\n';
     if (settlement !== null) {
@@ -156,7 +162,7 @@ export async function runDailyOrderReport() {
         message += '\n🌽 <b>옥수수 주문 상세</b>\n';
         for (const [name, qty] of Object.entries(cornOrders)) message += '  • ' + name + ': ' + qty + '개\n';
       }
-    } else if (newOrderCount === 0 && dispatchCount === 0 && deliveringCount === 0 && confirmedCount === 0) {
+    } else if (newOrderCount === 0 && dispatchCount === 0 && deliveringCount === 0 && deliveredCount === 0 && confirmedCount === 0) {
       message += '\n처리할 주문이 없습니다.';
     }
     const buttons = [];
@@ -174,7 +180,7 @@ export async function runDailyOrderReport() {
     }
     const replyMarkup = buttons.length > 0 ? { inline_keyboard: buttons } : undefined;
     await sendTelegram(message, replyMarkup);
-    console.log('[스케줄러] 보고 완료 - 신규:' + newOrderCount + ' 발주:' + dispatchCount + ' 배송:' + deliveringCount + ' 확정:' + confirmedCount + ' 정산:' + (settlement?.settleAmount || 0) + '원');
+    console.log('[스케줄러] 보고 완료 - 신규:' + newOrderCount + ' 배송준비:' + dispatchCount + ' 배송중:' + deliveringCount + ' 배송완료:' + deliveredCount + ' 확정:' + confirmedCount + ' 정산:' + (settlement?.settleAmount || 0) + '원');
   } catch (error) {
     console.error('[스케줄러] 오류:', error);
     await sendTelegram('❌ [자동 보고] 오류 발생\n' + String(error));
