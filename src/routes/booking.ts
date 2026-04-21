@@ -393,8 +393,10 @@ bookingRouter.post('/submit-verification', async (req: Request, res: Response) =
 bookingRouter.post('/availability', async (req: Request, res: Response) => {
   const { sessionId, businessName, date } = req.body;
 
-  const session = sessionId ? sessionStore.get(sessionId) : null;
-  // 비로그인(guest) 상태로도 조회 허용 - 쿠키 없이 진행
+  // 세션 자동 복구: sessionId 없으면 최신 세션 사용
+  const session = sessionId
+    ? sessionStore.get(sessionId)
+    : sessionStore.getLatest();
 
   const browser = await chromium.launch({
     headless: true,
@@ -406,23 +408,53 @@ bookingRouter.post('/availability', async (req: Request, res: Response) => {
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     });
 
-    // 저장된 쿠키 복원 (로그인 세션이 있는 경우만)
     if (session) await context.addCookies(session.cookies);
     const page = await context.newPage();
 
-    // 네이버 예약 검색
-    const searchQuery = encodeURIComponent(`${businessName} 네이버 예약`);
-    await page.goto(`https://search.naver.com/search.naver?query=${searchQuery}`, { waitUntil: 'networkidle' });
+    // 1단계: 네이버 플레이스 검색 (예약 버튼 존재 여부 확인)
+    const searchQuery = encodeURIComponent(`${businessName}`);
+    await page.goto(`https://search.naver.com/search.naver?query=${searchQuery}&where=place`, { waitUntil: 'networkidle', timeout: 20000 });
     await page.waitForTimeout(2000);
 
-    const screenshotBuf = await page.screenshot({ fullPage: false });
-    const screenshot = `data:image/png;base64,${screenshotBuf.toString('base64')}`;
+    // 업체 정보 패널에서 예약 버튼 찾기
+    const hasBookingBtn = await page.locator(
+      'a[href*="booking.naver.com"], a:has-text("예약하기"), button:has-text("예약하기"), .booking_btn, [class*="booking"]'
+    ).count() > 0;
 
-    // 예약 링크 찾기
-    const bookingLink = await page.locator('a[href*="booking.naver.com"], a:has-text("예약하기"), a:has-text("예약")').first().getAttribute('href').catch(() => null);
+    // 예약 불가 업체
+    if (!hasBookingBtn) {
+      // 업체 정보 스크린샷 (검색 결과 패널)
+      const placePanel = page.locator('.place_section, .api_subject_bx, .place_bluelink').first();
+      let screenshot = '';
+      if (await placePanel.count() > 0) {
+        const buf = await placePanel.screenshot().catch(async () => await page.screenshot({ fullPage: false }));
+        screenshot = `data:image/png;base64,${buf.toString('base64')}`;
+      } else {
+        const buf = await page.screenshot({ fullPage: false });
+        screenshot = `data:image/png;base64,${buf.toString('base64')}`;
+      }
+
+      // 전화번호 추출 시도
+      const phone = await page.locator('.xlx3J, [class*="phone"], .place_phone').first().textContent().catch(() => '');
+
+      await browser.close();
+      return res.json({
+        success: true,
+        bookingAvailable: false,
+        availableSlots: [],
+        phone: phone?.trim() || '',
+        screenshot,
+        message: `${businessName}은(는) 네이버 예약 시스템을 사용하지 않습니다. 전화 예약이 필요할 수 있습니다.`,
+      });
+    }
+
+    // 2단계: 예약 링크로 이동
+    const bookingLink = await page.locator(
+      'a[href*="booking.naver.com"], a:has-text("예약하기")'
+    ).first().getAttribute('href').catch(() => null);
 
     if (bookingLink) {
-      await page.goto(bookingLink, { waitUntil: 'networkidle' });
+      await page.goto(bookingLink, { waitUntil: 'networkidle', timeout: 20000 });
       await page.waitForTimeout(2000);
 
       // 날짜 선택
@@ -434,27 +466,35 @@ bookingRouter.post('/availability', async (req: Request, res: Response) => {
         }
       }
 
-      // 예약 가능 시간 슬롯 수집
-      const slots = await page.locator('.time_slot, .booking_time, [class*="time"], button[class*="time"]').allTextContents();
-      const availableSlots = slots.filter(s => s.trim() && !s.includes('마감') && !s.includes('불가'));
+      // 예약 가능 시간 슬롯 수집 (실제 슬롯만)
+      const allSlots = await page.locator(
+        '.time_slot, .booking_time, [class*="timeSlot"], [class*="time_item"], button[class*="time"]'
+      ).allTextContents();
+      const availableSlots = allSlots
+        .map(s => s.trim())
+        .filter(s => s && /\d{1,2}:\d{2}/.test(s) && !s.includes('마감') && !s.includes('불가') && !s.includes('휴무'));
 
       const bookingScreenshot = await page.screenshot({ fullPage: false });
       await browser.close();
 
       return res.json({
         success: true,
-        availableSlots: availableSlots.length > 0 ? availableSlots : ['10:00', '11:00', '14:00', '15:00', '16:00'],
+        bookingAvailable: true,
+        availableSlots,
         bookingUrl: bookingLink,
         screenshot: `data:image/png;base64,${bookingScreenshot.toString('base64')}`,
+        message: availableSlots.length > 0
+          ? `${availableSlots.length}개 시간대 예약 가능`
+          : '오늘은 예약 가능한 시간이 없습니다.',
       });
     }
 
     await browser.close();
     return res.json({
       success: true,
-      availableSlots: ['10:00', '11:00', '14:00', '15:00', '16:00'],
-      screenshot,
-      message: '예약 페이지를 찾지 못했습니다. 직접 예약 URL을 확인해주세요.',
+      bookingAvailable: false,
+      availableSlots: [],
+      message: '예약 페이지를 찾지 못했습니다.',
     });
 
   } catch (err: any) {
@@ -680,4 +720,18 @@ bookingRouter.post('/place-detail', async (req: Request, res: Response) => {
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
+});
+
+// ── 세션 상태 확인 API - 서버에 저장된 최신 세션 반환 ──
+bookingRouter.get('/session-status', (req: Request, res: Response) => {
+  const latest = sessionStore.getLatest();
+  if (latest) {
+    return res.json({
+      success: true,
+      sessionId: latest.id,
+      userId: latest.userId,
+      lastUsed: latest.lastUsed,
+    });
+  }
+  return res.json({ success: false, sessionId: null });
 });
