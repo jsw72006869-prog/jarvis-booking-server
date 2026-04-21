@@ -3,26 +3,26 @@
 // 텔레그램으로 보고합니다.
 // 인증 방식: bcrypt (네이버 커머스API 공식 방식)
 
-export async function sendTelegram(message, replyMarkup) {
+export async function sendTelegram(message: string, replyMarkup?: any) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN || '';
   const chatId = process.env.TELEGRAM_CHAT_ID || '';
   if (!botToken || !chatId) return null;
   try {
-    const body = { chat_id: chatId, text: message, parse_mode: 'HTML' };
+    const body: any = { chat_id: chatId, text: message, parse_mode: 'HTML' };
     if (replyMarkup) body.reply_markup = replyMarkup;
     const res = await fetch('https://api.telegram.org/bot' + botToken + '/sendMessage', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    const data = await res.json();
+    const data = await res.json() as any;
     if (!data.ok) { console.error('[텔레그램] 발송 실패:', data.description); return null; }
     console.log('[텔레그램] 발송 성공 to chat_id:', chatId, 'message_id:', data.result?.message_id);
     return data.result?.message_id || null;
   } catch (e) { console.error('[텔레그램] 발송 오류:', e); return null; }
 }
 
-export async function answerCallbackQuery(callbackQueryId, text) {
+export async function answerCallbackQuery(callbackQueryId: string, text: string) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN || '';
   if (!botToken) return;
   try {
@@ -51,13 +51,13 @@ export async function getSmartStoreToken() {
     });
     const response = await fetch('https://api.commerce.naver.com/external/v1/oauth2/token?' + params.toString(),
       { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-    const data = await response.json();
+    const data = await response.json() as any;
     if (data.error || data.code) { console.error('[토큰발급] 실패:', data.error || data.code, '-', data.error_description || data.message); return null; }
     console.log('[토큰발급] 성공'); return data.access_token || null;
   } catch (e) { console.error('[토큰발급] 오류:', e); return null; }
 }
 
-async function getOrderCountByStatus(token, statuses, fromDate, toDate) {
+async function getOrderCountByStatus(token: string, statuses: string[], fromDate: string, toDate: string) {
   try {
     const statusParam = statuses.map(s => 'orderStatuses=' + s).join('&');
     const res = await fetch(
@@ -65,30 +65,30 @@ async function getOrderCountByStatus(token, statuses, fromDate, toDate) {
       'lastChangedFrom=' + fromDate + 'T00:00:00.000Z&lastChangedTo=' + toDate + 'T23:59:59.000Z&' +
       statusParam + '&page=1&pageSize=1',
       { headers: { 'Authorization': 'Bearer ' + token } });
-    const data = await res.json();
+    const data = await res.json() as any;
     return data.totalCount || 0;
   } catch (e) { console.error('[주문조회] 오류:', e); return 0; }
 }
 
-export async function getNewOrderDetails(token, fromDate, toDate) {
+export async function getNewOrderDetails(token: string, fromDate: string, toDate: string) {
   try {
     const res = await fetch(
       'https://api.commerce.naver.com/external/v1/pay-order/seller/orders/last-changed-statuses?' +
       'lastChangedFrom=' + fromDate + 'T00:00:00.000Z&lastChangedTo=' + toDate + 'T23:59:59.000Z&' +
       'orderStatuses=PAYED&page=1&pageSize=100',
       { headers: { 'Authorization': 'Bearer ' + token } });
-    const data = await res.json();
+    const data = await res.json() as any;
     return data.data?.lastChangeStatuses || [];
   } catch (e) { console.error('[신규주문 상세조회] 오류:', e); return []; }
 }
 
-export async function getDailySettlement(token, settleDate) {
+export async function getDailySettlement(token: string, settleDate: string) {
   try {
     const res = await fetch(
       'https://api.commerce.naver.com/external/v1/pay-settle/settle/daily?' +
       'settleStartDate=' + settleDate + '&settleEndDate=' + settleDate,
       { headers: { 'Authorization': 'Bearer ' + token } });
-    const data = await res.json();
+    const data = await res.json() as any;
     console.log('[정산조회] 응답:', JSON.stringify(data).substring(0, 300));
     if (data.data && Array.isArray(data.data) && data.data.length > 0) {
       let totalAmount = 0, totalCount = 0;
