@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { bookingRouter } from './routes/booking';
+import { startOrderMonitor } from './order-monitor';
 import { sessionStore } from './session-store';
 import {
   runDailyOrderReport,
@@ -610,6 +611,8 @@ function scheduleDaily9AM() {
 
 // 스케줄러 시작
 scheduleDaily9AM();
+// 실시간 주문 모니터 시작 (5분 간격 폴링)
+startOrderMonitor();
 
 app.listen(PORT, () => {
   console.log(`🤖 Jarvis Booking Server running on port ${PORT}`);
