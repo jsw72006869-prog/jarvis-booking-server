@@ -2,6 +2,9 @@
 // 매일 아침 9시(한국시간)에 자동으로 스마트스토어 주문/정산 현황을 조회하고
 // 텔레그램으로 보고합니다.
 // 인증 방식: bcrypt (네이버 커머스API 공식 방식)
+// 개선: 토큰 캐싱 + IP 변경 감지 + 실패 시 명확한 안내
+
+import { getCachedToken, setCachedToken, handleTokenFailure } from './ip-manager';
 
 export async function sendTelegram(message: string, replyMarkup?: any) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -34,27 +37,75 @@ export async function answerCallbackQuery(callbackQueryId: string, text: string)
   } catch (e) { console.error('[텔레그램] Callback 응답 오류:', e); }
 }
 
-export async function getSmartStoreToken() {
+export async function getSmartStoreToken(): Promise<string | null> {
+  // 1. 캐시된 토큰이 있으면 재사용 (불필요한 발급 요청 방지)
+  const cached = getCachedToken();
+  if (cached) return cached;
+
   const clientId = process.env.SMARTSTORE_CLIENT_ID || '';
   const clientSecret = process.env.SMARTSTORE_CLIENT_SECRET || '';
-  if (!clientId || !clientSecret) { console.error('[스마트스토어] 환경변수 없음'); return null; }
-  try {
-    const bcrypt = await import('bcryptjs');
-    const timestamp = String(Math.floor(Date.now() - 3000));
-    const password = clientId + '_' + timestamp;
-    const hashed = bcrypt.hashSync(password, clientSecret);
-    const clientSecretSign = Buffer.from(hashed).toString('base64');
-    console.log('[토큰발급] 시도 중... client_id 앞 8자리:', clientId.substring(0, 8));
-    const params = new URLSearchParams({
-      client_id: clientId, timestamp, client_secret_sign: clientSecretSign,
-      grant_type: 'client_credentials', type: 'SELF',
-    });
-    const response = await fetch('https://api.commerce.naver.com/external/v1/oauth2/token?' + params.toString(),
-      { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-    const data = await response.json() as any;
-    if (data.error || data.code) { console.error('[토큰발급] 실패:', data.error || data.code, '-', data.error_description || data.message); return null; }
-    console.log('[토큰발급] 성공'); return data.access_token || null;
-  } catch (e) { console.error('[토큰발급] 오류:', e); return null; }
+  if (!clientId || !clientSecret) {
+    console.error('[스마트스토어] 환경변수 없음 - SMARTSTORE_CLIENT_ID/SECRET 확인 필요');
+    await handleTokenFailure('EnvMissing', '환경변수(SMARTSTORE_CLIENT_ID/SECRET)가 설정되지 않았습니다.');
+    return null;
+  }
+
+  // 2. 최대 2회 재시도 (일시적 네트워크 오류 대응)
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const bcrypt = await import('bcryptjs');
+      // 네이버 커머스 API: timestamp는 현재시각 기준 ±300초 이내여야 함
+      const timestamp = String(Date.now());
+      const password = clientId + '_' + timestamp;
+      const hashed = bcrypt.hashSync(password, clientSecret);
+      const clientSecretSign = Buffer.from(hashed).toString('base64');
+
+      console.log(`[토큰발급] 시도 ${attempt}/2 - client_id 앞 8자리: ${clientId.substring(0, 8)}`);
+
+      const params = new URLSearchParams({
+        client_id: clientId,
+        timestamp,
+        client_secret_sign: clientSecretSign,
+        grant_type: 'client_credentials',
+        type: 'SELF',
+      });
+
+      const response = await fetch(
+        'https://api.commerce.naver.com/external/v1/oauth2/token?' + params.toString(),
+        { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      );
+      const data = await response.json() as any;
+
+      if (data.error || data.code) {
+        const errCode = data.error || data.code || '';
+        const errMsg = data.error_description || data.message || '';
+        console.error(`[토큰발급] 실패 (시도 ${attempt}):`, errCode, '-', errMsg);
+
+        // 마지막 시도에서도 실패 → IP 문제 안내 발송
+        if (attempt === 2) {
+          await handleTokenFailure(errCode, errMsg);
+        }
+        continue;
+      }
+
+      const token = data.access_token || null;
+      if (token) {
+        setCachedToken(token); // 캐시에 저장
+        console.log('[토큰발급] 성공');
+        return token;
+      }
+    } catch (e) {
+      console.error(`[토큰발급] 오류 (시도 ${attempt}):`, e);
+      if (attempt === 2) {
+        await handleTokenFailure('NetworkError', String(e));
+      }
+    }
+
+    // 재시도 전 1초 대기
+    if (attempt < 2) await new Promise(r => setTimeout(r, 1000));
+  }
+
+  return null;
 }
 
 async function getOrderCountByStatus(token: string, statuses: string[], fromDate: string, toDate: string) {
@@ -107,7 +158,11 @@ export async function runDailyOrderReport() {
   console.log('[스케줄러] 자동 주문 보고 시작...');
   try {
     const token = await getSmartStoreToken();
-    if (!token) { await sendTelegram('❌ [자동 보고] 스마트스토어 인증 실패\n서버 로그를 확인해주세요.'); return; }
+    if (!token) {
+      // handleTokenFailure에서 이미 상세 안내 메시지를 발송했으므로 중복 발송 안 함
+      console.error('[스케줄러] 토큰 발급 실패 - 보고 중단');
+      return;
+    }
     const kstOffset = 9 * 60 * 60 * 1000;
     const kstNow = new Date(Date.now() + kstOffset);
     const todayKST = kstNow.toISOString().split('T')[0];
@@ -126,9 +181,9 @@ export async function runDailyOrderReport() {
       getOrderCountByStatus(token, ['PURCHASE_DECIDED'], thirtyDaysAgoKST, todayKST),
       getDailySettlement(token, yesterdayKST),
     ]);
-    let newOrders = [];
+    let newOrders: any[] = [];
     if (newOrderCount > 0) newOrders = await getNewOrderDetails(token, thirtyDaysAgoKST, todayKST);
-    let message = '📊 <b>[자동 보고] ' + yesterdayKST + ' 현황</b>\n';
+    let message = '📊 <b>[자동 보고] ' + todayKST + ' 현황</b>\n';
     message += '━━━━━━━━━━━━━━━\n';
     message += '🆕 신규 주문: <b>' + newOrderCount + '건</b>\n';
     message += '📦 배송 준비: <b>' + dispatchCount + '건</b>\n';
@@ -146,8 +201,8 @@ export async function runDailyOrderReport() {
       message += '━━━━━━━━━━━━━━━\n';
     }
     if (newOrders.length > 0) {
-      const bamOrders = {};
-      const cornOrders = {};
+      const bamOrders: Record<string, number> = {};
+      const cornOrders: Record<string, number> = {};
       for (const order of newOrders) {
         const optionName = order.productOption || order.productName || '';
         const isCorn = optionName.includes('옥수수') || optionName.includes('옥광') || optionName.includes('3X') || optionName.includes('찰옥');
@@ -165,10 +220,10 @@ export async function runDailyOrderReport() {
     } else if (newOrderCount === 0 && dispatchCount === 0 && deliveringCount === 0 && deliveredCount === 0 && confirmedCount === 0) {
       message += '\n처리할 주문이 없습니다.';
     }
-    const buttons = [];
+    const buttons: any[] = [];
     if (newOrderCount > 0) {
       buttons.push([
-        { text: '📋 발주서 발송하기', callback_data: 'confirm_dispatch_' + yesterdayKST },
+        { text: '📋 발주서 발송하기', callback_data: 'confirm_dispatch_' + todayKST },
         { text: '⏭ 나중에', callback_data: 'skip_dispatch' },
       ]);
     }

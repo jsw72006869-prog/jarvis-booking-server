@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { bookingRouter } from './routes/booking';
 import { startOrderMonitor } from './order-monitor';
+import { checkAndNotifyIPChange } from './ip-manager';
 import { sessionStore } from './session-store';
 import {
   runDailyOrderReport,
@@ -618,6 +619,8 @@ app.listen(PORT, () => {
   console.log(`🤖 Jarvis Booking Server running on port ${PORT}`);
   // 서버 시작 시 Webhook 자동 등록
   autoSetupWebhook();
+  // 서버 시작 시 IP 변경 감지 및 텔레그램 알림
+  checkAndNotifyIPChange();
 });
 
 // ─── 서버 시작 시 Webhook 자동 등록 ───
