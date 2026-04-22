@@ -1,5 +1,8 @@
 import express from 'express';
 import { generateSettlementXlsx, generateBamDispatchXlsx, generateCornDispatchXlsx, calcCostSummary, isCornProduct, parseNaverOrderSheet, type OrderItem } from './settlement';
+import { execSync } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { bookingRouter } from './routes/booking';
@@ -339,14 +342,16 @@ app.post('/telegram-webhook', async (req, res) => {
         } else {
           const { bamOrders, cornOrders } = pending;
           try {
-            await sendTelegram('📤 발주서+정산서 이메일 발송 중...');
+            await sendTelegram('⏳ 3단계: 발주서+정산서 엑셀 생성 중...');
             const { sendEmailNotification } = await import('./email');
             const emailTo = process.env.DISPATCH_EMAIL || 'jungsng805@naver.com';
 
             if (bamOrders.length > 0) {
+              await sendTelegram(`🌰 밤 발주서(로젠택배) 생성 중... (${bamOrders.length}건)`);
               const bamDispatch = generateBamDispatchXlsx(dateStr, bamOrders);
               const bamSettlement = generateSettlementXlsx(dateStr, bamOrders, 'bam');
               broadcastEvent({ type: 'node_active', node: 'email', message: '밤 발주서(로젠) 이메일 발송 중...', progress: 60, flow: ['brain->email'] });
+              await sendTelegram(`✅ 밤 발주서 완료\n⏳ 이메일 발송 중...`);
               await sendEmailNotification({
                 to: emailTo,
                 subject: `[셀렌] ${dateStr} 밤 발주서 (로젠택배)`,
@@ -359,9 +364,11 @@ app.post('/telegram-webhook', async (req, res) => {
             }
 
             if (cornOrders.length > 0) {
+              await sendTelegram(`🌽 옥수수 발주서(롯데택배) 생성 중... (${cornOrders.length}건)`);
               const cornDispatch = generateCornDispatchXlsx(dateStr, cornOrders);
               const cornSettlement = generateSettlementXlsx(dateStr, cornOrders, 'corn');
               broadcastEvent({ type: 'node_active', node: 'email', message: '옥수수 발주서(롯데) 이메일 발송 중...', progress: 75, flow: ['brain->email'] });
+              await sendTelegram(`✅ 옥수수 발주서 완료\n⏳ 이메일 발송 중...`);
               await sendEmailNotification({
                 to: emailTo,
                 subject: `[셀렌] ${dateStr} 옥수수 발주서 (롯데택배)`,
@@ -445,7 +452,7 @@ app.post('/telegram-webhook', async (req, res) => {
         const isExcel = fname.endsWith('.xlsx') || fname.endsWith('.xls');
         if (isExcel) {
           broadcastEvent({ type: 'node_active', node: 'brain', message: '통합주문서 파일 수신: ' + doc.file_name, progress: 10, flow: ['telegram->brain'] });
-          await sendTelegram('📂 통합주문서 파일을 받았습니다. 분석 중...');
+          await sendTelegram(`📂 <b>통합주문서 파일 수신</b>\n━━━━━━━━━━━━━━━\n파일명: ${doc.file_name}\n\n⏳ 1단계: 파일 분석 중...`);
           try {
             const botToken = process.env.TELEGRAM_BOT_TOKEN || '';
             // 파일 다운로드
@@ -457,6 +464,7 @@ app.post('/telegram-webhook', async (req, res) => {
             const fileBuffer = Buffer.from(await fileRes.arrayBuffer());
 
             // 파싱 및 분류
+            await sendTelegram('✅ 1단계 완료\n⏳ 2단계: 밤/옥수수 분류 중...');
             const parsed = parseNaverOrderSheet(fileBuffer, '1234');
             const { bamOrders, cornOrders, unknownOrders, totalCount } = parsed;
 
@@ -466,10 +474,11 @@ app.post('/telegram-webhook', async (req, res) => {
               await sendTelegram('⚠️ 주문 데이터를 찾을 수 없습니다. 파일을 확인해주세요.');
             } else {
               const dateStr = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().split('T')[0];
-              let previewMsg = `📋 <b>통합주문서 분석 완료</b>\n━━━━━━━━━━━━━━━\n`;
+              let previewMsg = `✅ 2단계 완료\n\n📋 <b>통합주문서 분석 결과</b>\n━━━━━━━━━━━━━━━\n`;
+              previewMsg += `📅 날짜: ${dateStr}\n`;
               previewMsg += `📦 총 ${totalCount}건\n`;
-              previewMsg += `🌰 밤(로젠): ${bamOrders.length}건\n`;
-              previewMsg += `🌽 옥수수(롯데): ${cornOrders.length}건\n`;
+              previewMsg += `🌰 밤(로젠택배): ${bamOrders.length}건\n`;
+              previewMsg += `🌽 옥수수(롯데택배): ${cornOrders.length}건\n`;
               if (unknownOrders.length > 0) previewMsg += `❓ 미분류: ${unknownOrders.length}건\n`;
               previewMsg += `━━━━━━━━━━━━━━━\n발주서+정산서를 이메일로 발송할까요?`;
 
@@ -975,3 +984,69 @@ async function autoSetupWebhook() {
     console.error('[Webhook] 자동 등록 오류:', e);
   }
 }
+
+// ─── 원가 변경 명령어 처리 (index.ts 자연어 처리 부분에 추가할 코드) ───
+// 위치: 자연어 인식 섹션 (684줄 이후)에 다음 코드를 추가:
+/*
+        // 원가 변경
+        } else if (
+          t.includes('원가') && (t.includes('변경') || t.includes('수정') || t.includes('바꿔') || t.includes('변경해'))
+        ) {
+          const isBam = t.includes('밤');
+          const isCorn = t.includes('옥수수') || t.includes('옥광');
+          
+          if (!isBam && !isCorn) {
+            await sendTelegram('❓ 상품을 명시해 주세요.\n예: "밤 원가 8000 -> 9000으로 변경"');
+            return;
+          }
+
+          const numbers = text.match(/\d+/g);
+          if (!numbers || numbers.length < 2) {
+            await sendTelegram('❓ 원가 형식이 잘못되었습니다.\n예: "밤 원가 8000 -> 9000으로 변경"');
+            return;
+          }
+
+          const oldCost = parseInt(numbers[0]);
+          const newCost = parseInt(numbers[1]);
+
+          try {
+            const costFilePath = path.join(process.cwd(), 'data', 'product_cost.json');
+            const costData = JSON.parse(fs.readFileSync(costFilePath, 'utf-8'));
+            
+            let updated = false;
+            const category = isBam ? '밤' : '옥수수';
+            const products = costData[category] || [];
+
+            for (const product of products) {
+              if (product.cost === oldCost) {
+                product.cost = newCost;
+                updated = true;
+              }
+            }
+
+            if (!updated) {
+              await sendTelegram(`❌ 원가 ${oldCost}원을 찾을 수 없습니다.`);
+              return;
+            }
+
+            costData.last_updated = new Date().toISOString();
+            costData.updated_by = 'TELEGRAM_USER';
+            
+            fs.writeFileSync(costFilePath, JSON.stringify(costData, null, 2));
+            
+            execSync(`cd ${process.cwd()} && git add data/product_cost.json`, { stdio: 'pipe' });
+            execSync(`cd ${process.cwd()} && git commit -m "docs: 원가 수정 - ${category} ${oldCost}원 -> ${newCost}원"`, { stdio: 'pipe' });
+            execSync(`cd ${process.cwd()} && git push origin main`, { stdio: 'pipe' });
+
+            await sendTelegram(
+              `✅ <b>${category} 원가 변경 완료</b>\n` +
+              `━━━━━━━━━━━━━━━\n` +
+              `변경 전: ${oldCost.toLocaleString('ko-KR')}원\n` +
+              `변경 후: ${newCost.toLocaleString('ko-KR')}원\n` +
+              `━━━━━━━━━━━━━━━\n` +
+              `📁 GitHub에 자동 저장되었습니다.`
+            );
+          } catch (e) {
+            await sendTelegram(`❌ 원가 변경 실패\n${String(e)}`);
+          }
+*/
