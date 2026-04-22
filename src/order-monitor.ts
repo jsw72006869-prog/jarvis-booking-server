@@ -1,7 +1,21 @@
 // 실시간 주문 모니터 - 5분마다 스마트스토어 주문 상태 변화 감지
 // 새 주문 또는 상태 변경 시 텔레그램으로 즉시 알림
+// ★ 모든 네이버 API 호출은 Quotaguard 프록시 경유 → 고정 IP 보장
 
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import { getSmartStoreToken, sendTelegram } from './smartstore-scheduler.js';
+
+/**
+ * 네이버 커머스 API 전용 fetch 래퍼 (프록시 경유)
+ */
+function naverFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  const proxyUrl = process.env.QUOTAGUARDSTATIC_URL;
+  const fetchOptions: any = { ...options };
+  if (proxyUrl) {
+    fetchOptions.agent = new HttpsProxyAgent(proxyUrl);
+  }
+  return fetch(url, fetchOptions);
+}
 
 interface OrderSnapshot {
   orderId: string;
@@ -33,7 +47,6 @@ const STATUS_LABEL: Record<string, string> = {
 
 async function fetchRecentOrders(token: string): Promise<OrderSnapshot[]> {
   try {
-    // 최근 30일 모든 주문 조회 (상태 무관)
     const kstOffset = 9 * 60 * 60 * 1000;
     const kstNow = new Date(Date.now() + kstOffset);
     const thirtyDaysAgo = new Date(kstNow);
@@ -51,7 +64,8 @@ async function fetchRecentOrders(token: string): Promise<OrderSnapshot[]> {
 
     for (const status of statuses) {
       try {
-        const res = await fetch(
+        // ★ 프록시 경유
+        const res = await naverFetch(
           `https://api.commerce.naver.com/external/v1/pay-order/seller/orders/last-changed-statuses?` +
           `lastChangedFrom=${fromDate}T00:00:00.000Z&lastChangedTo=${toDate}T23:59:59.000Z&` +
           `orderStatuses=${status}&page=1&pageSize=100`,
@@ -96,7 +110,6 @@ async function checkOrderChanges() {
     }
 
     if (isFirstRun) {
-      // 첫 실행 시 스냅샷만 저장, 알림 없음
       previousSnapshot = currentSnapshot;
       isFirstRun = false;
       console.log(`[주문모니터] 초기화 완료 - 현재 주문 ${currentSnapshot.size}건 추적 시작`);
@@ -106,21 +119,17 @@ async function checkOrderChanges() {
     const newOrders: OrderSnapshot[] = [];
     const statusChanges: Array<{ order: OrderSnapshot; prevStatus: string }> = [];
 
-    // 새 주문 및 상태 변경 감지
     for (const [orderId, current] of currentSnapshot) {
       const prev = previousSnapshot.get(orderId);
       if (!prev) {
-        // 새로 나타난 주문
         if (current.status === 'PAYED') {
           newOrders.push(current);
         }
       } else if (prev.status !== current.status) {
-        // 상태가 변경된 주문
         statusChanges.push({ order: current, prevStatus: prev.status });
       }
     }
 
-    // 새 주문 알림
     if (newOrders.length > 0) {
       let msg = `🔔 <b>새 주문 ${newOrders.length}건 접수!</b>\n`;
       msg += '━━━━━━━━━━━━━━━\n';
@@ -142,13 +151,11 @@ async function checkOrderChanges() {
       console.log(`[주문모니터] 새 주문 알림 발송 - ${newOrders.length}건`);
     }
 
-    // 중요 상태 변경 알림 (배송완료, 구매확정, 취소/반품 요청)
     const importantChanges = statusChanges.filter(({ order }) =>
       ['DELIVERED', 'PURCHASE_DECIDED', 'CANCEL_REQUEST', 'RETURN_REQUEST', 'EXCHANGE_REQUEST'].includes(order.status)
     );
 
     if (importantChanges.length > 0) {
-      // 상태별로 그룹화
       const grouped: Record<string, typeof importantChanges> = {};
       for (const change of importantChanges) {
         if (!grouped[change.order.status]) grouped[change.order.status] = [];
@@ -171,7 +178,6 @@ async function checkOrderChanges() {
       console.log(`[주문모니터] 상태 변경 알림 발송 - ${importantChanges.length}건`);
     }
 
-    // 스냅샷 업데이트
     previousSnapshot = currentSnapshot;
 
   } catch (e) {
@@ -183,10 +189,8 @@ export function startOrderMonitor() {
   if (monitorInterval) {
     clearInterval(monitorInterval);
   }
-  console.log('[주문모니터] 실시간 모니터링 시작 (5분 간격)');
-  // 즉시 첫 실행 (스냅샷 초기화)
+  console.log('[주문모니터] 실시간 모니터링 시작 (5분 간격) - 프록시:', process.env.QUOTAGUARDSTATIC_URL ? '✅ 활성' : '⚠️ 미설정');
   checkOrderChanges();
-  // 5분마다 반복
   monitorInterval = setInterval(checkOrderChanges, 5 * 60 * 1000);
 }
 

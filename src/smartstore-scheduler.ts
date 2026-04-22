@@ -2,9 +2,37 @@
 // 매일 아침 9시(한국시간)에 자동으로 스마트스토어 주문/정산 현황을 조회하고
 // 텔레그램으로 보고합니다.
 // 인증 방식: bcrypt (네이버 커머스API 공식 방식)
-// 개선: 토큰 캐싱 + IP 변경 감지 + 실패 시 명확한 안내 + 정확한 현황 조회
+// 핵심: 모든 네이버 API 호출은 Quotaguard Static 프록시를 통해 고정 IP로 나감
 
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import { getCachedToken, setCachedToken, handleTokenFailure } from './ip-manager';
+
+/**
+ * Quotaguard Static 프록시 에이전트 생성
+ * 환경변수 QUOTAGUARDSTATIC_URL이 설정되어 있으면 프록시 사용
+ * 없으면 직접 연결 (개발 환경)
+ */
+function getProxyAgent(): HttpsProxyAgent<string> | undefined {
+  const proxyUrl = process.env.QUOTAGUARDSTATIC_URL;
+  if (proxyUrl) {
+    return new HttpsProxyAgent(proxyUrl);
+  }
+  return undefined;
+}
+
+/**
+ * 네이버 커머스 API 전용 fetch 래퍼
+ * 항상 Quotaguard 프록시를 통해 호출 → 고정 IP 보장
+ */
+async function naverFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  const agent = getProxyAgent();
+  const fetchOptions: any = { ...options };
+  if (agent) {
+    fetchOptions.agent = agent;
+    console.log('[프록시] Quotaguard 경유 →', url.substring(0, 80));
+  }
+  return fetch(url, fetchOptions);
+}
 
 export async function sendTelegram(message: string, replyMarkup?: any) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -13,6 +41,7 @@ export async function sendTelegram(message: string, replyMarkup?: any) {
   try {
     const body: any = { chat_id: chatId, text: message, parse_mode: 'HTML' };
     if (replyMarkup) body.reply_markup = replyMarkup;
+    // 텔레그램은 IP 제한 없으므로 프록시 불필요 → 일반 fetch 사용
     const res = await fetch('https://api.telegram.org/bot' + botToken + '/sendMessage', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -57,7 +86,7 @@ export async function getSmartStoreToken(): Promise<string | null> {
       const hashed = bcrypt.hashSync(password, clientSecret);
       const clientSecretSign = Buffer.from(hashed).toString('base64');
 
-      console.log(`[토큰발급] 시도 ${attempt}/2 - client_id 앞 8자리: ${clientId.substring(0, 8)}`);
+      console.log(`[토큰발급] 시도 ${attempt}/2 - Quotaguard 프록시 경유`);
 
       const params = new URLSearchParams({
         client_id: clientId,
@@ -67,7 +96,8 @@ export async function getSmartStoreToken(): Promise<string | null> {
         type: 'SELF',
       });
 
-      const response = await fetch(
+      // ★ 핵심: 토큰 발급도 프록시 경유 → 고정 IP로 나감
+      const response = await naverFetch(
         'https://api.commerce.naver.com/external/v1/oauth2/token?' + params.toString(),
         { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
       );
@@ -84,7 +114,7 @@ export async function getSmartStoreToken(): Promise<string | null> {
       const token = data.access_token || null;
       if (token) {
         setCachedToken(token);
-        console.log('[토큰발급] 성공');
+        console.log('[토큰발급] 성공 ✅');
         return token;
       }
     } catch (e) {
@@ -98,18 +128,10 @@ export async function getSmartStoreToken(): Promise<string | null> {
   return null;
 }
 
-/**
- * KST 날짜 문자열(yyyy-MM-dd) 생성 헬퍼
- */
 function toKSTDateStr(date: Date): string {
   return date.toISOString().split('T')[0];
 }
 
-/**
- * 날짜 범위를 N일 단위 구간으로 분할
- * 네이버 커머스 API는 단일 호출로 전체 기간 조회 불가 (날짜 범위 필수)
- * 여러 구간으로 나눠 조회 후 합산
- */
 function splitDateRanges(fromDate: string, toDate: string, chunkDays: number): Array<{from: string, to: string}> {
   const ranges: Array<{from: string, to: string}> = [];
   let current = new Date(fromDate + 'T00:00:00.000Z');
@@ -132,10 +154,6 @@ function splitDateRanges(fromDate: string, toDate: string, chunkDays: number): A
   return ranges;
 }
 
-/**
- * 단일 날짜 구간에서 상태별 주문 건수 조회
- * lastChangedStatuses API 사용 (변경 상품 주문 내역 조회)
- */
 async function getOrderCountInRange(token: string, statuses: string[], fromDate: string, toDate: string): Promise<number> {
   try {
     const statusParam = statuses.map(s => 'orderStatuses=' + s).join('&');
@@ -145,7 +163,8 @@ async function getOrderCountInRange(token: string, statuses: string[], fromDate:
       'lastChangedTo=' + toDate + 'T23:59:59.000Z&' +
       statusParam + '&page=1&pageSize=1';
 
-    const res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
+    // ★ 프록시 경유
+    const res = await naverFetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
     const data = await res.json() as any;
     return data.totalCount || 0;
   } catch (e) {
@@ -154,10 +173,6 @@ async function getOrderCountInRange(token: string, statuses: string[], fromDate:
   }
 }
 
-/**
- * 전체 기간(90일)을 30일 구간으로 나눠 조회 후 합산
- * → 스마트스토어 앱 현황판과 동일한 누적 건수 반환
- */
 async function getOrderCountByStatus(token: string, statuses: string[], fromDate: string, toDate: string): Promise<number> {
   const ranges = splitDateRanges(fromDate, toDate, 30);
   let total = 0;
@@ -174,7 +189,8 @@ async function getOrderCountByStatus(token: string, statuses: string[], fromDate
 
 export async function getNewOrderDetails(token: string, fromDate: string, toDate: string) {
   try {
-    const res = await fetch(
+    // ★ 프록시 경유
+    const res = await naverFetch(
       'https://api.commerce.naver.com/external/v1/pay-order/seller/orders/last-changed-statuses?' +
       'lastChangedFrom=' + fromDate + 'T00:00:00.000Z&lastChangedTo=' + toDate + 'T23:59:59.000Z&' +
       'orderStatuses=PAYED&page=1&pageSize=100',
@@ -186,7 +202,8 @@ export async function getNewOrderDetails(token: string, fromDate: string, toDate
 
 export async function getDailySettlement(token: string, settleDate: string) {
   try {
-    const res = await fetch(
+    // ★ 프록시 경유
+    const res = await naverFetch(
       'https://api.commerce.naver.com/external/v1/pay-settle/settle/daily?' +
       'settleStartDate=' + settleDate + '&settleEndDate=' + settleDate,
       { headers: { 'Authorization': 'Bearer ' + token } });
@@ -207,6 +224,7 @@ export async function getDailySettlement(token: string, settleDate: string) {
 
 export async function runDailyOrderReport() {
   console.log('[스케줄러] 자동 주문 보고 시작...');
+  console.log('[스케줄러] 프록시:', process.env.QUOTAGUARDSTATIC_URL ? '✅ Quotaguard 활성' : '⚠️ 프록시 미설정');
   try {
     const token = await getSmartStoreToken();
     if (!token) {
@@ -221,7 +239,6 @@ export async function runDailyOrderReport() {
     yesterday.setDate(yesterday.getDate() - 1);
     const yesterdayKST = toKSTDateStr(yesterday);
 
-    // 90일 전부터 오늘까지 전체 구간 조회 (30일씩 3구간으로 분할)
     const ninetyDaysAgo = new Date(kstNow);
     ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
     const ninetyDaysAgoKST = toKSTDateStr(ninetyDaysAgo);
@@ -237,7 +254,6 @@ export async function runDailyOrderReport() {
       getDailySettlement(token, yesterdayKST),
     ]);
 
-    // 신규 주문 상세는 최근 30일만 조회 (발주서 발송 목적)
     const thirtyDaysAgo = new Date(kstNow);
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
     const thirtyDaysAgoKST = toKSTDateStr(thirtyDaysAgo);
@@ -300,7 +316,7 @@ export async function runDailyOrderReport() {
     }
     const replyMarkup = buttons.length > 0 ? { inline_keyboard: buttons } : undefined;
     await sendTelegram(message, replyMarkup);
-    console.log('[스케줄러] 보고 완료 - 신규:' + newOrderCount + ' 배송준비:' + dispatchCount + ' 배송중:' + deliveringCount + ' 배송완료:' + deliveredCount + ' 확정:' + confirmedCount + ' 정산:' + (settlement?.settleAmount || 0) + '원');
+    console.log('[스케줄러] 보고 완료 ✅');
   } catch (error) {
     console.error('[스케줄러] 오류:', error);
     await sendTelegram('❌ [자동 보고] 오류 발생\n' + String(error));
