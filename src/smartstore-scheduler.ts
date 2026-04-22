@@ -3,7 +3,7 @@
 // 텔레그램으로 보고합니다.
 // 인증 방식: bcrypt (네이버 커머스API 공식 방식)
 // ★ 핵심: Node.js 내장 fetch는 agent를 무시함 → axios 사용으로 프록시 확실 적용
-// ★ 2024-04-22 수정: last-changed-statuses → /v1/pay-order/seller/product-orders (조건형 조회)
+// ★ 2026-04-22 수정: 조건형 API + 순차 처리 + 재시도 로직으로 rate limit 대응
 
 import axios, { AxiosRequestConfig } from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -21,9 +21,10 @@ function getProxyAgent(): HttpsProxyAgent<string> | undefined {
 }
 
 /**
- * 네이버 커머스 API 전용 GET (axios + 프록시)
+ * 네이버 커머스 API 전용 GET (axios + 프록시 + 재시도)
+ * rate limit 에러 시 지수 백오프로 재시도
  */
-async function naverGet(url: string, headers: Record<string, string> = {}): Promise<any> {
+async function naverGet(url: string, headers: Record<string, string> = {}, maxRetries = 3): Promise<any> {
   const agent = getProxyAgent();
   const config: AxiosRequestConfig = { url, method: 'GET', headers };
   if (agent) {
@@ -31,8 +32,25 @@ async function naverGet(url: string, headers: Record<string, string> = {}): Prom
     config.httpAgent = agent;
     console.log('[프록시] Quotaguard GET →', url.substring(0, 100));
   }
-  const res = await axios(config);
-  return res.data;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await axios(config);
+      return res.data;
+    } catch (e: any) {
+      const status = e.response?.status;
+      const errMsg = e.response?.data?.message || e.message || '';
+
+      // rate limit (429) 또는 서비스 일시 불가 (503) → 재시도
+      if ((status === 429 || status === 503 || errMsg.includes('요청이 많아') || errMsg.includes('일시적으로')) && attempt < maxRetries) {
+        const waitSec = attempt * 3; // 3초, 6초, 9초...
+        console.warn(`[API] Rate limit 감지 (시도 ${attempt}/${maxRetries}), ${waitSec}초 대기 후 재시도...`);
+        await new Promise(r => setTimeout(r, waitSec * 1000));
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 /**
@@ -57,7 +75,6 @@ export async function sendTelegram(message: string, replyMarkup?: any) {
   try {
     const body: any = { chat_id: chatId, text: message, parse_mode: 'HTML' };
     if (replyMarkup) body.reply_markup = replyMarkup;
-    // 텔레그램은 IP 제한 없으므로 프록시 불필요
     const res = await axios.post('https://api.telegram.org/bot' + botToken + '/sendMessage', body);
     const data = res.data;
     if (!data.ok) { console.error('[텔레그램] 발송 실패:', data.description); return null; }
@@ -106,7 +123,6 @@ export async function getSmartStoreToken(): Promise<string | null> {
         type: 'SELF',
       });
 
-      // ★ 핵심: 토큰 발급도 axios + 프록시 경유 → 고정 IP로 나감
       const data = await naverPost(
         'https://api.commerce.naver.com/external/v1/oauth2/token?' + params.toString(),
         undefined,
@@ -146,21 +162,15 @@ function toKSTDateStr(date: Date): string {
 }
 
 /**
- * 조건형 상품 주문 상세 내역 조회 API를 사용하여
- * 특정 날짜(1일)의 모든 주문을 조회하고 상태별로 카운트합니다.
- * 
- * API: GET /v1/pay-order/seller/product-orders
- * - rangeType: PAYED_DATETIME (결제일 기준)
- * - from/to: 최대 24시간 차이 (1일 단위로 조회)
- * - productOrderStatuses: 생략하여 모든 상태 반환
- * - pageSize: 300 (최대)
- * - 페이징: hasNext가 true면 다음 페이지 조회
+ * 조건형 API로 특정 날짜(1일)의 주문을 조회합니다.
+ * ★ 순차 처리 + 재시도 로직으로 rate limit 대응
  */
-async function getOrdersForDate(
+async function getOrdersForDateWithStatus(
   token: string,
-  dateStr: string
-): Promise<Record<string, number>> {
-  const statusCounts: Record<string, number> = {};
+  dateStr: string,
+  statusFilter?: string
+): Promise<any[]> {
+  const orders: any[] = [];
   let page = 1;
   let hasNext = true;
 
@@ -168,7 +178,7 @@ async function getOrdersForDate(
     try {
       const fromDT = dateStr + 'T00:00:00.000%2B09:00';
       const toDT = dateStr + 'T23:59:59.000%2B09:00';
-      const url =
+      let url =
         'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders?' +
         'from=' + fromDT + '&' +
         'to=' + toDT + '&' +
@@ -176,24 +186,34 @@ async function getOrdersForDate(
         'pageSize=300&' +
         'page=' + page;
 
+      if (statusFilter) {
+        url += '&productOrderStatuses=' + statusFilter;
+      }
+
       const data = await naverGet(url, { 'Authorization': 'Bearer ' + token });
 
       const contents = data?.data?.contents || [];
       const pagination = data?.data?.pagination;
 
       for (const order of contents) {
-        const status = order.productOrderStatus || order.lastProductOrderStatus || 'UNKNOWN';
-        statusCounts[status] = (statusCounts[status] || 0) + 1;
+        const po = order.productOrder || order;
+        orders.push({
+          productOrderId: order.productOrderId || po.productOrderId,
+          orderId: order.orderId || po.orderId,
+          productOrderStatus: order.productOrderStatus || po.productOrderStatus || 'UNKNOWN',
+          productName: po.productName || order.productName || '',
+          productOption: po.productOption || order.productOption || '',
+          quantity: po.quantity || order.quantity || 1,
+          totalPaymentAmount: po.totalPaymentAmount || order.totalPaymentAmount || 0,
+          buyerName: po.buyerName || order.buyerName || '',
+          receiverName: po.receiverName || order.receiverName || '',
+          paymentDate: po.paymentDate || order.paymentDate || '',
+        });
       }
 
       hasNext = pagination?.hasNext === true;
       page++;
-
-      // 안전장치: 최대 10페이지까지만 (3000건)
-      if (page > 10) {
-        console.warn(`[주문조회] ${dateStr} 페이지 초과 (10+), 중단`);
-        break;
-      }
+      if (page > 10) break;
     } catch (e: any) {
       const errMsg = e.response?.data?.message || e.message || String(e);
       console.error(`[주문조회] ${dateStr} page=${page} 오류:`, errMsg);
@@ -201,59 +221,74 @@ async function getOrdersForDate(
     }
   }
 
+  return orders;
+}
+
+/**
+ * ★ 핵심 함수: 상태별 주문 건수를 효율적으로 조회합니다.
+ * 
+ * 전략: 각 상태별로 적절한 기간만 순차 조회
+ * - PAYED (신규주문): 최근 30일 (결제 후 30일 이상 미처리는 드묾)
+ * - DELIVERING_HOLD (배송준비): 최근 14일
+ * - DELIVERING (배송중): 최근 14일
+ * - DELIVERED (배송완료): 최근 14일
+ * - PURCHASE_DECIDED (구매확정): 최근 7일
+ * 
+ * 순차 처리 + 요청 간 1.5초 딜레이로 rate limit 방지
+ */
+async function getStatusCounts(token: string): Promise<Record<string, number>> {
+  const statusCounts: Record<string, number> = {};
+  const kstOffset = 9 * 60 * 60 * 1000;
+  const kstNow = new Date(Date.now() + kstOffset);
+
+  // 상태별 조회 기간 설정 (일수)
+  const statusConfig: Array<{ status: string; days: number }> = [
+    { status: 'PAYED', days: 30 },
+    { status: 'DELIVERING_HOLD', days: 14 },
+    { status: 'DELIVERING', days: 14 },
+    { status: 'DELIVERED', days: 14 },
+    { status: 'PURCHASE_DECIDED', days: 7 },
+  ];
+
+  for (const { status, days } of statusConfig) {
+    let count = 0;
+    const startDate = new Date(kstNow);
+    startDate.setDate(startDate.getDate() - days);
+
+    // 날짜 목록 생성
+    const dates: string[] = [];
+    const current = new Date(startDate);
+    while (current <= kstNow) {
+      dates.push(current.toISOString().split('T')[0]);
+      current.setDate(current.getDate() + 1);
+    }
+
+    console.log(`[주문조회] ${status} 상태 조회 시작 (${dates.length}일, ${dates[0]} ~ ${dates[dates.length - 1]})`);
+
+    // ★ 순차 처리 - 한 번에 하나씩만 요청
+    for (const dateStr of dates) {
+      try {
+        const orders = await getOrdersForDateWithStatus(token, dateStr, status);
+        count += orders.length;
+
+        // ★ 요청 간 1.5초 딜레이 (rate limit 방지)
+        await new Promise(r => setTimeout(r, 1500));
+      } catch (e) {
+        console.error(`[주문조회] ${status} ${dateStr} 실패:`, e);
+        // 실패해도 계속 진행
+      }
+    }
+
+    statusCounts[status] = count;
+    console.log(`[주문조회] ${status}: ${count}건`);
+  }
+
   return statusCounts;
 }
 
 /**
- * 여러 날짜의 주문을 병렬로 조회하고 상태별로 합산합니다.
- * API rate limit을 고려하여 동시 요청 수를 제한합니다.
- */
-async function getAllOrderStatusCounts(
-  token: string,
-  fromDateStr: string,
-  toDateStr: string
-): Promise<Record<string, number>> {
-  const totalCounts: Record<string, number> = {};
-
-  // 날짜 목록 생성
-  const dates: string[] = [];
-  const current = new Date(fromDateStr + 'T00:00:00.000Z');
-  const end = new Date(toDateStr + 'T00:00:00.000Z');
-
-  while (current <= end) {
-    dates.push(current.toISOString().split('T')[0]);
-    current.setDate(current.getDate() + 1);
-  }
-
-  console.log(`[주문조회] 총 ${dates.length}일 조회 시작 (${fromDateStr} ~ ${toDateStr})`);
-
-  // 동시 요청 제한: 5개씩 병렬 처리
-  const BATCH_SIZE = 5;
-  for (let i = 0; i < dates.length; i += BATCH_SIZE) {
-    const batch = dates.slice(i, i + BATCH_SIZE);
-    const results = await Promise.all(
-      batch.map(date => getOrdersForDate(token, date))
-    );
-
-    for (const result of results) {
-      for (const [status, count] of Object.entries(result)) {
-        totalCounts[status] = (totalCounts[status] || 0) + count;
-      }
-    }
-
-    // 배치 간 짧은 딜레이 (rate limit 방지)
-    if (i + BATCH_SIZE < dates.length) {
-      await new Promise(r => setTimeout(r, 200));
-    }
-  }
-
-  console.log('[주문조회] 전체 상태별 결과:', JSON.stringify(totalCounts));
-  return totalCounts;
-}
-
-/**
  * 신규 주문(PAYED 상태)의 상세 정보를 조회합니다.
- * 조건형 API를 사용하여 최근 30일간 PAYED 상태 주문을 조회합니다.
+ * ★ 순차 처리 + 딜레이로 rate limit 방지
  */
 export async function getNewOrderDetails(token: string, fromDate: string, toDate: string) {
   const allOrders: any[] = [];
@@ -268,63 +303,18 @@ export async function getNewOrderDetails(token: string, fromDate: string, toDate
     current.setDate(current.getDate() + 1);
   }
 
-  // 5개씩 병렬 처리
-  const BATCH_SIZE = 5;
-  for (let i = 0; i < dates.length; i += BATCH_SIZE) {
-    const batch = dates.slice(i, i + BATCH_SIZE);
-    const batchResults = await Promise.all(
-      batch.map(async (dateStr) => {
-        const orders: any[] = [];
-        let page = 1;
-        let hasNext = true;
+  console.log(`[신규주문] ${dates.length}일 순차 조회 시작 (${fromDate} ~ ${toDate})`);
 
-        while (hasNext) {
-          try {
-            const fromDT = dateStr + 'T00:00:00.000%2B09:00';
-            const toDT = dateStr + 'T23:59:59.000%2B09:00';
-            const url =
-              'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders?' +
-              'from=' + fromDT + '&' +
-              'to=' + toDT + '&' +
-              'rangeType=PAYED_DATETIME&' +
-              'productOrderStatuses=PAYED&' +
-              'pageSize=300&' +
-              'page=' + page;
-
-            const data = await naverGet(url, { 'Authorization': 'Bearer ' + token });
-            const contents = data?.data?.contents || [];
-
-            for (const order of contents) {
-              orders.push({
-                productOrderId: order.productOrderId,
-                orderId: order.orderId,
-                productName: order.productOrder?.productName || order.productName || '',
-                productOption: order.productOrder?.productOption || order.productOption || '',
-                quantity: order.productOrder?.quantity || order.quantity || 1,
-                totalPaymentAmount: order.productOrder?.totalPaymentAmount || order.totalPaymentAmount || 0,
-                orderDate: order.productOrder?.paymentDate || order.paymentDate || '',
-              });
-            }
-
-            hasNext = data?.data?.pagination?.hasNext === true;
-            page++;
-            if (page > 10) break;
-          } catch (e) {
-            console.error(`[신규주문 상세] ${dateStr} page=${page} 오류:`, e);
-            hasNext = false;
-          }
-        }
-
-        return orders;
-      })
-    );
-
-    for (const orders of batchResults) {
+  // ★ 순차 처리 - 한 번에 하나씩만 요청
+  for (const dateStr of dates) {
+    try {
+      const orders = await getOrdersForDateWithStatus(token, dateStr, 'PAYED');
       allOrders.push(...orders);
-    }
 
-    if (i + BATCH_SIZE < dates.length) {
-      await new Promise(r => setTimeout(r, 200));
+      // 요청 간 1.5초 딜레이
+      await new Promise(r => setTimeout(r, 1500));
+    } catch (e) {
+      console.error(`[신규주문] ${dateStr} 실패:`, e);
     }
   }
 
@@ -333,7 +323,6 @@ export async function getNewOrderDetails(token: string, fromDate: string, toDate
 
 export async function getDailySettlement(token: string, settleDate: string) {
   try {
-    // ★ axios + 프록시 경유
     const data = await naverGet(
       'https://api.commerce.naver.com/external/v1/pay-settle/settle/daily?' +
       'settleStartDate=' + settleDate + '&settleEndDate=' + settleDate,
@@ -369,18 +358,12 @@ export async function runDailyOrderReport() {
     yesterday.setDate(yesterday.getDate() - 1);
     const yesterdayKST = toKSTDateStr(yesterday);
 
-    // 90일 전부터 오늘까지 조회
-    const ninetyDaysAgo = new Date(kstNow);
-    ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
-    const ninetyDaysAgoKST = toKSTDateStr(ninetyDaysAgo);
+    // ★ 정산은 먼저 조회 (빠름)
+    const settlement = await getDailySettlement(token, yesterdayKST);
 
-    console.log(`[스케줄러] 조회 기간: ${ninetyDaysAgoKST} ~ ${todayKST}`);
-
-    // ★ 핵심 변경: 조건형 API로 전체 주문 조회 후 상태별 카운트
-    const [statusCounts, settlement] = await Promise.all([
-      getAllOrderStatusCounts(token, ninetyDaysAgoKST, todayKST),
-      getDailySettlement(token, yesterdayKST),
-    ]);
+    // ★ 핵심: 상태별 순차 조회 (rate limit 방지)
+    console.log(`[스케줄러] 상태별 주문 건수 조회 시작...`);
+    const statusCounts = await getStatusCounts(token);
 
     const newOrderCount = statusCounts['PAYED'] || 0;
     const dispatchCount = statusCounts['DELIVERING_HOLD'] || 0;
@@ -390,13 +373,14 @@ export async function runDailyOrderReport() {
 
     console.log(`[스케줄러] 상태별 건수 - 신규:${newOrderCount} 배송준비:${dispatchCount} 배송중:${deliveringCount} 배송완료:${deliveredCount} 구매확정:${confirmedCount}`);
 
-    // 신규 주문 상세 조회 (최근 30일)
-    const thirtyDaysAgo = new Date(kstNow);
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const thirtyDaysAgoKST = toKSTDateStr(thirtyDaysAgo);
-
+    // 신규 주문 상세 조회 (최근 7일만 - 효율성)
     let newOrders: any[] = [];
-    if (newOrderCount > 0) newOrders = await getNewOrderDetails(token, thirtyDaysAgoKST, todayKST);
+    if (newOrderCount > 0) {
+      const sevenDaysAgo = new Date(kstNow);
+      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+      const sevenDaysAgoKST = toKSTDateStr(sevenDaysAgo);
+      newOrders = await getNewOrderDetails(token, sevenDaysAgoKST, todayKST);
+    }
 
     let message = '📊 <b>[자동 보고] ' + todayKST + ' 현황</b>\n';
     message += '━━━━━━━━━━━━━━━\n';

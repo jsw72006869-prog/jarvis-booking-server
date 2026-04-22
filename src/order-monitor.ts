@@ -1,16 +1,16 @@
 // 실시간 주문 모니터 - 5분마다 스마트스토어 주문 상태 변화 감지
 // 새 주문 또는 상태 변경 시 텔레그램으로 즉시 알림
 // ★ Node.js 내장 fetch는 agent를 무시함 → axios 사용으로 프록시 확실 적용
-// ★ 2024-04-22 수정: 조건형 API(/v1/pay-order/seller/product-orders)로 변경
+// ★ 2026-04-22 수정: 순차 처리 + 딜레이로 rate limit 대응
 
 import axios, { AxiosRequestConfig } from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { getSmartStoreToken, sendTelegram } from './smartstore-scheduler.js';
 
 /**
- * 네이버 커머스 API 전용 GET (axios + 프록시)
+ * 네이버 커머스 API 전용 GET (axios + 프록시 + 재시도)
  */
-async function naverGet(url: string, headers: Record<string, string> = {}): Promise<any> {
+async function naverGet(url: string, headers: Record<string, string> = {}, maxRetries = 3): Promise<any> {
   const proxyUrl = process.env.QUOTAGUARDSTATIC_URL;
   const config: AxiosRequestConfig = { url, method: 'GET', headers };
   if (proxyUrl) {
@@ -18,8 +18,23 @@ async function naverGet(url: string, headers: Record<string, string> = {}): Prom
     config.httpsAgent = agent;
     config.httpAgent = agent;
   }
-  const res = await axios(config);
-  return res.data;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await axios(config);
+      return res.data;
+    } catch (e: any) {
+      const status = e.response?.status;
+      const errMsg = e.response?.data?.message || e.message || '';
+      if ((status === 429 || status === 503 || errMsg.includes('요청이 많아') || errMsg.includes('일시적으로')) && attempt < maxRetries) {
+        const waitSec = attempt * 3;
+        console.warn(`[주문모니터 API] Rate limit (시도 ${attempt}/${maxRetries}), ${waitSec}초 대기...`);
+        await new Promise(r => setTimeout(r, waitSec * 1000));
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 interface OrderSnapshot {
@@ -52,7 +67,6 @@ const STATUS_LABEL: Record<string, string> = {
 
 /**
  * 특정 날짜의 주문을 조건형 API로 조회합니다.
- * API: GET /v1/pay-order/seller/product-orders
  */
 async function fetchOrdersForDate(token: string, dateStr: string): Promise<OrderSnapshot[]> {
   const orders: OrderSnapshot[] = [];
@@ -103,12 +117,12 @@ async function fetchRecentOrders(token: string): Promise<OrderSnapshot[]> {
     const kstOffset = 9 * 60 * 60 * 1000;
     const kstNow = new Date(Date.now() + kstOffset);
 
-    // 모니터링은 최근 7일만 조회 (효율성)
-    const sevenDaysAgo = new Date(kstNow);
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    // 모니터링은 최근 3일만 조회 (효율성 + rate limit 방지)
+    const threeDaysAgo = new Date(kstNow);
+    threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
 
     const dates: string[] = [];
-    const current = new Date(sevenDaysAgo);
+    const current = new Date(threeDaysAgo);
     const end = new Date(kstNow);
 
     while (current <= end) {
@@ -118,18 +132,15 @@ async function fetchRecentOrders(token: string): Promise<OrderSnapshot[]> {
 
     const allOrders: OrderSnapshot[] = [];
 
-    // 4개씩 병렬 처리
-    const BATCH_SIZE = 4;
-    for (let i = 0; i < dates.length; i += BATCH_SIZE) {
-      const batch = dates.slice(i, i + BATCH_SIZE);
-      const results = await Promise.all(
-        batch.map(date => fetchOrdersForDate(token, date))
-      );
-      for (const orders of results) {
+    // ★ 순차 처리 + 딜레이
+    for (const date of dates) {
+      try {
+        const orders = await fetchOrdersForDate(token, date);
         allOrders.push(...orders);
-      }
-      if (i + BATCH_SIZE < dates.length) {
-        await new Promise(r => setTimeout(r, 200));
+        // 요청 간 1.5초 딜레이
+        await new Promise(r => setTimeout(r, 1500));
+      } catch (e) {
+        console.error(`[주문모니터] ${date} 조회 실패:`, e);
       }
     }
 
