@@ -358,7 +358,7 @@ export async function getDailySettlement(token: string, settleDate: string) {
  * 
  * 활성 주문 상태:
  * - PAYED: 신규 주문 (결제 완료, 발주확인 전)
- * - DELIVERING_HOLD: 배송 준비 (발주확인 완료)
+ * - OK: 배송 준비 (발주확인 완료) ← 판매자센터 '배송준비' 상태
  * - DELIVERING: 배송 중
  * - DELIVERED: 배송 완료
  * - PURCHASE_DECIDED: 구매 확정
@@ -409,7 +409,7 @@ export async function runDailyOrderReport() {
     }
 
     const newOrderCount = statusCounts['PAYED'] || 0;
-    const dispatchCount = statusCounts['DELIVERING_HOLD'] || 0;
+    const dispatchCount = (statusCounts['OK'] || 0) + (statusCounts['DELIVERING_HOLD'] || 0);
     const deliveringCount = statusCounts['DELIVERING'] || 0;
     const deliveredCount = statusCounts['DELIVERED'] || 0;
     const confirmedCount = statusCounts['PURCHASE_DECIDED'] || 0;
