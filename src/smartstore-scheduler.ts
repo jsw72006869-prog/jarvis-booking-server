@@ -258,11 +258,11 @@ async function getOrdersForOneDay(
       page++;
       if (page > 10) break;
     } catch (e: any) {
-      const status = e.response?.status;
-      const errData = e.response?.data;
-      console.error(`[주문조회] ${dateStr} ${statusFilter || '전체'} page=${page} 오류:`,
-        `status=${status}`,
-        JSON.stringify(errData || e.message || '').substring(0, 500));
+      const errStatus = e.response?.status || '';
+      const errMsg = e.response?.data?.message || e.message || '';
+      const errCode = e.response?.data?.code || '';
+      const errInvalid = JSON.stringify(e.response?.data?.invalidInputs || []);
+      console.error(`[주문조회] ${dateStr} ${statusFilter || '전체'} page=${page} 오류: status=${errStatus} code=${errCode} msg=${errMsg} invalidInputs=${errInvalid}`);
       hasNext = false;
     }
   }
@@ -305,7 +305,12 @@ export async function getDailySettlement(token: string, settleDate: string) {
     }
     if (data.settleAmount !== undefined) return { settleAmount: data.settleAmount || 0, settleCount: data.settleCount || 0 };
     return { settleAmount: 0, settleCount: 0 };
-  } catch (e) { console.error('[정산조회] 오류:', e); return null; }
+  } catch (e: any) {
+    const errStatus = e.response?.status || '';
+    const errMsg = e.response?.data?.message || e.message || '';
+    console.error(`[정산조회] 오류: status=${errStatus} msg=${errMsg}`);
+    return null;
+  }
 }
 
 /**
@@ -423,8 +428,9 @@ export async function runDailyOrderReport() {
     const replyMarkup = buttons.length > 0 ? { inline_keyboard: buttons } : undefined;
     await sendTelegram(message, replyMarkup);
     console.log('[스케줄러] 보고 완료 ✅');
-  } catch (error) {
-    console.error('[스케줄러] 오류:', error);
-    await sendTelegram('❌ [자동 보고] 오류 발생\n' + String(error));
+  } catch (error: any) {
+    const errMsg = error.response?.data?.message || error.message || String(error);
+    console.error('[스케줄러] 오류:', errMsg);
+    await sendTelegram('❌ [자동 보고] 오류 발생\n' + errMsg);
   }
 }
