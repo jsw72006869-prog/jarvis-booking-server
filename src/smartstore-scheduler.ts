@@ -2,7 +2,7 @@
 // 매일 아침 9시(한국시간)에 자동으로 스마트스토어 주문/정산 현황을 조회하고
 // 텔레그램으로 보고합니다.
 // 인증 방식: bcrypt (네이버 커머스API 공식 방식)
-// 개선: 토큰 캐싱 + IP 변경 감지 + 실패 시 명확한 안내
+// 개선: 토큰 캐싱 + IP 변경 감지 + 실패 시 명확한 안내 + 정확한 현황 조회
 
 import { getCachedToken, setCachedToken, handleTokenFailure } from './ip-manager';
 
@@ -54,7 +54,6 @@ export async function getSmartStoreToken(): Promise<string | null> {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const bcrypt = await import('bcryptjs');
-      // 네이버 커머스 API: timestamp는 현재시각 기준 ±300초 이내여야 함
       const timestamp = String(Date.now());
       const password = clientId + '_' + timestamp;
       const hashed = bcrypt.hashSync(password, clientSecret);
@@ -80,8 +79,6 @@ export async function getSmartStoreToken(): Promise<string | null> {
         const errCode = data.error || data.code || '';
         const errMsg = data.error_description || data.message || '';
         console.error(`[토큰발급] 실패 (시도 ${attempt}):`, errCode, '-', errMsg);
-
-        // 마지막 시도에서도 실패 → IP 문제 안내 발송
         if (attempt === 2) {
           await handleTokenFailure(errCode, errMsg);
         }
@@ -90,7 +87,7 @@ export async function getSmartStoreToken(): Promise<string | null> {
 
       const token = data.access_token || null;
       if (token) {
-        setCachedToken(token); // 캐시에 저장
+        setCachedToken(token);
         console.log('[토큰발급] 성공');
         return token;
       }
@@ -101,14 +98,53 @@ export async function getSmartStoreToken(): Promise<string | null> {
       }
     }
 
-    // 재시도 전 1초 대기
     if (attempt < 2) await new Promise(r => setTimeout(r, 1000));
   }
 
   return null;
 }
 
-async function getOrderCountByStatus(token: string, statuses: string[], fromDate: string, toDate: string) {
+/**
+ * 현재 상태별 주문 건수 조회
+ * - paymentDateFrom/To: 결제일 기준 범위 (최대 90일)
+ * - productOrderStatuses: 현재 상태 기준 필터 (lastChangedStatuses와 다름)
+ *
+ * 주의: lastChangedFrom/To API는 "기간 내 상태 변경된 주문"만 반환하므로
+ * 오래된 배송중/배송완료 주문이 누락됨 → productOrderStatuses 사용
+ */
+async function getOrderCountByStatus(token: string, statuses: string[], fromDate: string, toDate: string): Promise<number> {
+  try {
+    const statusParam = statuses.map(s => 'productOrderStatuses=' + s).join('&');
+    const url =
+      'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders?' +
+      'paymentDateFrom=' + fromDate + 'T00:00:00.000Z&' +
+      'paymentDateTo=' + toDate + 'T23:59:59.000Z&' +
+      statusParam + '&page=1&pageSize=1';
+
+    const res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
+    const data = await res.json() as any;
+
+    // 응답 구조 로깅 (디버그용)
+    console.log(`[주문조회] 상태:${statuses.join(',')} → totalCount:${data.totalCount} count:${data.count}`);
+
+    // API가 에러 반환 시 lastChangedStatuses로 fallback
+    if (data.code && data.code !== 200) {
+      console.warn(`[주문조회] product-orders 실패(${data.code}), lastChangedStatuses로 fallback`);
+      return await getOrderCountFallback(token, statuses, fromDate, toDate);
+    }
+
+    return data.totalCount || data.count || 0;
+  } catch (e) {
+    console.error('[주문조회] 오류:', e);
+    return 0;
+  }
+}
+
+/**
+ * Fallback: lastChangedStatuses API (기존 방식)
+ * product-orders API 실패 시 사용
+ */
+async function getOrderCountFallback(token: string, statuses: string[], fromDate: string, toDate: string): Promise<number> {
   try {
     const statusParam = statuses.map(s => 'orderStatuses=' + s).join('&');
     const res = await fetch(
@@ -118,18 +154,25 @@ async function getOrderCountByStatus(token: string, statuses: string[], fromDate
       { headers: { 'Authorization': 'Bearer ' + token } });
     const data = await res.json() as any;
     return data.totalCount || 0;
-  } catch (e) { console.error('[주문조회] 오류:', e); return 0; }
+  } catch (e) { return 0; }
 }
 
 export async function getNewOrderDetails(token: string, fromDate: string, toDate: string) {
   try {
-    const res = await fetch(
-      'https://api.commerce.naver.com/external/v1/pay-order/seller/orders/last-changed-statuses?' +
-      'lastChangedFrom=' + fromDate + 'T00:00:00.000Z&lastChangedTo=' + toDate + 'T23:59:59.000Z&' +
-      'orderStatuses=PAYED&page=1&pageSize=100',
-      { headers: { 'Authorization': 'Bearer ' + token } });
+    // 신규 주문(PAYED) 상세는 product-orders API 사용
+    const url =
+      'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders?' +
+      'paymentDateFrom=' + fromDate + 'T00:00:00.000Z&' +
+      'paymentDateTo=' + toDate + 'T23:59:59.000Z&' +
+      'productOrderStatuses=PAYED&page=1&pageSize=100';
+
+    const res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
     const data = await res.json() as any;
-    return data.data?.lastChangeStatuses || [];
+
+    // product-orders 응답 구조: data.productOrders 또는 data.data
+    const orders = data.productOrders || data.data?.lastChangeStatuses || data.data || [];
+    console.log('[신규주문] 조회 건수:', orders.length);
+    return orders;
   } catch (e) { console.error('[신규주문 상세조회] 오류:', e); return []; }
 }
 
@@ -159,7 +202,6 @@ export async function runDailyOrderReport() {
   try {
     const token = await getSmartStoreToken();
     if (!token) {
-      // handleTokenFailure에서 이미 상세 안내 메시지를 발송했으므로 중복 발송 안 함
       console.error('[스케줄러] 토큰 발급 실패 - 보고 중단');
       return;
     }
@@ -169,20 +211,25 @@ export async function runDailyOrderReport() {
     const yesterday = new Date(kstNow);
     yesterday.setDate(yesterday.getDate() - 1);
     const yesterdayKST = yesterday.toISOString().split('T')[0];
-    // 누적 현황 조회를 위해 30일 범위 사용
-    const thirtyDaysAgo = new Date(kstNow);
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const thirtyDaysAgoKST = thirtyDaysAgo.toISOString().split('T')[0];
+
+    // 현재 진행중인 모든 주문 포함을 위해 90일 범위 사용
+    // (배송중/배송완료는 30일 이전 결제 주문도 포함될 수 있음)
+    const ninetyDaysAgo = new Date(kstNow);
+    ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+    const ninetyDaysAgoKST = ninetyDaysAgo.toISOString().split('T')[0];
+
     const [newOrderCount, dispatchCount, deliveringCount, deliveredCount, confirmedCount, settlement] = await Promise.all([
-      getOrderCountByStatus(token, ['PAYED'], thirtyDaysAgoKST, todayKST),
-      getOrderCountByStatus(token, ['DELIVERING_HOLD'], thirtyDaysAgoKST, todayKST),
-      getOrderCountByStatus(token, ['DELIVERING'], thirtyDaysAgoKST, todayKST),
-      getOrderCountByStatus(token, ['DELIVERED'], thirtyDaysAgoKST, todayKST),
-      getOrderCountByStatus(token, ['PURCHASE_DECIDED'], thirtyDaysAgoKST, todayKST),
+      getOrderCountByStatus(token, ['PAYED'], ninetyDaysAgoKST, todayKST),
+      getOrderCountByStatus(token, ['DELIVERING_HOLD'], ninetyDaysAgoKST, todayKST),
+      getOrderCountByStatus(token, ['DELIVERING'], ninetyDaysAgoKST, todayKST),
+      getOrderCountByStatus(token, ['DELIVERED'], ninetyDaysAgoKST, todayKST),
+      getOrderCountByStatus(token, ['PURCHASE_DECIDED'], ninetyDaysAgoKST, todayKST),
       getDailySettlement(token, yesterdayKST),
     ]);
+
     let newOrders: any[] = [];
-    if (newOrderCount > 0) newOrders = await getNewOrderDetails(token, thirtyDaysAgoKST, todayKST);
+    if (newOrderCount > 0) newOrders = await getNewOrderDetails(token, ninetyDaysAgoKST, todayKST);
+
     let message = '📊 <b>[자동 보고] ' + todayKST + ' 현황</b>\n';
     message += '━━━━━━━━━━━━━━━\n';
     message += '🆕 신규 주문: <b>' + newOrderCount + '건</b>\n';
@@ -191,6 +238,7 @@ export async function runDailyOrderReport() {
     message += '📬 배송 완료: <b>' + deliveredCount + '건</b>\n';
     message += '✅ 구매 확정: <b>' + confirmedCount + '건</b>\n';
     message += '━━━━━━━━━━━━━━━\n';
+
     if (settlement !== null) {
       if (settlement.settleAmount > 0) {
         const formattedAmount = settlement.settleAmount.toLocaleString('ko-KR');
@@ -200,11 +248,12 @@ export async function runDailyOrderReport() {
       } else { message += '💰 정산 입금: <b>0원</b>\n'; }
       message += '━━━━━━━━━━━━━━━\n';
     }
+
     if (newOrders.length > 0) {
       const bamOrders: Record<string, number> = {};
       const cornOrders: Record<string, number> = {};
       for (const order of newOrders) {
-        const optionName = order.productOption || order.productName || '';
+        const optionName = order.productOption || order.productName || order.productTitle || '';
         const isCorn = optionName.includes('옥수수') || optionName.includes('옥광') || optionName.includes('3X') || optionName.includes('찰옥');
         if (isCorn) cornOrders[optionName] = (cornOrders[optionName] || 0) + (order.quantity || 1);
         else bamOrders[optionName] = (bamOrders[optionName] || 0) + (order.quantity || 1);
@@ -220,6 +269,7 @@ export async function runDailyOrderReport() {
     } else if (newOrderCount === 0 && dispatchCount === 0 && deliveringCount === 0 && deliveredCount === 0 && confirmedCount === 0) {
       message += '\n처리할 주문이 없습니다.';
     }
+
     const buttons: any[] = [];
     if (newOrderCount > 0) {
       buttons.push([
