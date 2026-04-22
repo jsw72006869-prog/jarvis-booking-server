@@ -1,7 +1,6 @@
 // 실시간 주문 모니터 - 5분마다 스마트스토어 주문 상태 변화 감지
 // 새 주문 또는 상태 변경 시 텔레그램으로 즉시 알림
-// ★ Node.js 내장 fetch는 agent를 무시함 → axios 사용으로 프록시 확실 적용
-// ★ 2026-04-22 수정: 순차 처리 + 딜레이로 rate limit 대응
+// ★ 2026-04-22 최종 수정: 오늘 하루만 조회 → API 1번 호출
 
 import axios, { AxiosRequestConfig } from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -46,7 +45,7 @@ interface OrderSnapshot {
   orderAmount: number;
 }
 
-// 이전 스냅샷 메모리 저장 (서버 재시작 시 초기화됨)
+// 이전 스냅샷 메모리 저장
 let previousSnapshot: Map<string, OrderSnapshot> = new Map();
 let isFirstRun = true;
 let monitorInterval: NodeJS.Timeout | null = null;
@@ -66,17 +65,22 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 /**
- * 특정 날짜의 주문을 조건형 API로 조회합니다.
+ * ★ 오늘 하루 주문만 조회 - API 1번 호출
  */
-async function fetchOrdersForDate(token: string, dateStr: string): Promise<OrderSnapshot[]> {
+async function fetchTodayOrders(token: string): Promise<OrderSnapshot[]> {
   const orders: OrderSnapshot[] = [];
+
+  const kstOffset = 9 * 60 * 60 * 1000;
+  const kstNow = new Date(Date.now() + kstOffset);
+  const todayStr = kstNow.toISOString().split('T')[0];
+
   let page = 1;
   let hasNext = true;
 
   while (hasNext) {
     try {
-      const fromDT = dateStr + 'T00:00:00.000%2B09:00';
-      const toDT = dateStr + 'T23:59:59.000%2B09:00';
+      const fromDT = todayStr + 'T00:00:00.000%2B09:00';
+      const toDT = todayStr + 'T23:59:59.000%2B09:00';
       const url =
         'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders?' +
         'from=' + fromDT + '&' +
@@ -104,51 +108,12 @@ async function fetchOrdersForDate(token: string, dateStr: string): Promise<Order
       page++;
       if (page > 10) break;
     } catch (e) {
-      console.error(`[주문모니터] ${dateStr} page=${page} 조회 오류:`, e);
+      console.error(`[주문모니터] 오늘 주문 조회 오류:`, e);
       hasNext = false;
     }
   }
 
   return orders;
-}
-
-async function fetchRecentOrders(token: string): Promise<OrderSnapshot[]> {
-  try {
-    const kstOffset = 9 * 60 * 60 * 1000;
-    const kstNow = new Date(Date.now() + kstOffset);
-
-    // 모니터링은 최근 3일만 조회 (효율성 + rate limit 방지)
-    const threeDaysAgo = new Date(kstNow);
-    threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
-
-    const dates: string[] = [];
-    const current = new Date(threeDaysAgo);
-    const end = new Date(kstNow);
-
-    while (current <= end) {
-      dates.push(current.toISOString().split('T')[0]);
-      current.setDate(current.getDate() + 1);
-    }
-
-    const allOrders: OrderSnapshot[] = [];
-
-    // ★ 순차 처리 + 딜레이
-    for (const date of dates) {
-      try {
-        const orders = await fetchOrdersForDate(token, date);
-        allOrders.push(...orders);
-        // 요청 간 1.5초 딜레이
-        await new Promise(r => setTimeout(r, 1500));
-      } catch (e) {
-        console.error(`[주문모니터] ${date} 조회 실패:`, e);
-      }
-    }
-
-    return allOrders;
-  } catch (e) {
-    console.error('[주문모니터] 주문 조회 오류:', e);
-    return [];
-  }
 }
 
 async function checkOrderChanges() {
@@ -159,7 +124,7 @@ async function checkOrderChanges() {
       return;
     }
 
-    const currentOrders = await fetchRecentOrders(token);
+    const currentOrders = await fetchTodayOrders(token);
     const currentSnapshot = new Map<string, OrderSnapshot>();
     for (const order of currentOrders) {
       currentSnapshot.set(order.orderId, order);
@@ -168,7 +133,7 @@ async function checkOrderChanges() {
     if (isFirstRun) {
       previousSnapshot = currentSnapshot;
       isFirstRun = false;
-      console.log(`[주문모니터] 초기화 완료 - 현재 주문 ${currentSnapshot.size}건 추적 시작`);
+      console.log(`[주문모니터] 초기화 완료 - 오늘 주문 ${currentSnapshot.size}건 추적 시작`);
       return;
     }
 
