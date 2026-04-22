@@ -97,7 +97,7 @@ export function generateBamDispatchXlsx(date: string, orders: OrderItem[]): Buff
   const wb = XLSX.utils.book_new();
 
   const rows: any[][] = [
-    ['제  품 ', '수량', '보내시는분이름', '보내시는분 전화번호', '받는분이름', '받는분전화번호', '받는분핸드폰번호', '주소', '비고', '우편번호 '],
+    ['제  품 ', '수량', '보내시는분이름', '보내시는분 전화번호', '받는분이름', '받는분전화번호', '받는분핸드폰번호', '주소', '비고', '우편번호 ', '상품주문번호'],
   ];
 
   for (const order of orders) {
@@ -113,6 +113,7 @@ export function generateBamDispatchXlsx(date: string, orders: OrderItem[]): Buff
       order.address || '',
       '',  // 비고
       '',  // 우편번호
+      order.orderId || '',  // 상품주문번호 (송장 입력용)
     ]);
   }
 
@@ -120,7 +121,7 @@ export function generateBamDispatchXlsx(date: string, orders: OrderItem[]): Buff
   // 컬럼 너비 설정
   ws['!cols'] = [
     { wch: 30 }, { wch: 6 }, { wch: 12 }, { wch: 16 },
-    { wch: 10 }, { wch: 14 }, { wch: 14 }, { wch: 50 }, { wch: 10 }, { wch: 10 },
+    { wch: 10 }, { wch: 14 }, { wch: 14 }, { wch: 50 }, { wch: 10 }, { wch: 10 }, { wch: 22 },
   ];
   XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
 
