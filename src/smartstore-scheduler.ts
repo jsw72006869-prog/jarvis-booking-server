@@ -38,7 +38,6 @@ export async function answerCallbackQuery(callbackQueryId: string, text: string)
 }
 
 export async function getSmartStoreToken(): Promise<string | null> {
-  // 1. 캐시된 토큰이 있으면 재사용 (불필요한 발급 요청 방지)
   const cached = getCachedToken();
   if (cached) return cached;
 
@@ -50,7 +49,6 @@ export async function getSmartStoreToken(): Promise<string | null> {
     return null;
   }
 
-  // 2. 최대 2회 재시도 (일시적 네트워크 오류 대응)
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const bcrypt = await import('bcryptjs');
@@ -79,9 +77,7 @@ export async function getSmartStoreToken(): Promise<string | null> {
         const errCode = data.error || data.code || '';
         const errMsg = data.error_description || data.message || '';
         console.error(`[토큰발급] 실패 (시도 ${attempt}):`, errCode, '-', errMsg);
-        if (attempt === 2) {
-          await handleTokenFailure(errCode, errMsg);
-        }
+        if (attempt === 2) await handleTokenFailure(errCode, errMsg);
         continue;
       }
 
@@ -93,9 +89,7 @@ export async function getSmartStoreToken(): Promise<string | null> {
       }
     } catch (e) {
       console.error(`[토큰발급] 오류 (시도 ${attempt}):`, e);
-      if (attempt === 2) {
-        await handleTokenFailure('NetworkError', String(e));
-      }
+      if (attempt === 2) await handleTokenFailure('NetworkError', String(e));
     }
 
     if (attempt < 2) await new Promise(r => setTimeout(r, 1000));
@@ -105,74 +99,88 @@ export async function getSmartStoreToken(): Promise<string | null> {
 }
 
 /**
- * 현재 상태별 주문 건수 조회
- * - paymentDateFrom/To: 결제일 기준 범위 (최대 90일)
- * - productOrderStatuses: 현재 상태 기준 필터 (lastChangedStatuses와 다름)
- *
- * 주의: lastChangedFrom/To API는 "기간 내 상태 변경된 주문"만 반환하므로
- * 오래된 배송중/배송완료 주문이 누락됨 → productOrderStatuses 사용
+ * KST 날짜 문자열(yyyy-MM-dd) 생성 헬퍼
  */
-async function getOrderCountByStatus(token: string, statuses: string[], fromDate: string, toDate: string): Promise<number> {
+function toKSTDateStr(date: Date): string {
+  return date.toISOString().split('T')[0];
+}
+
+/**
+ * 날짜 범위를 N일 단위 구간으로 분할
+ * 네이버 커머스 API는 단일 호출로 전체 기간 조회 불가 (날짜 범위 필수)
+ * 여러 구간으로 나눠 조회 후 합산
+ */
+function splitDateRanges(fromDate: string, toDate: string, chunkDays: number): Array<{from: string, to: string}> {
+  const ranges: Array<{from: string, to: string}> = [];
+  let current = new Date(fromDate + 'T00:00:00.000Z');
+  const end = new Date(toDate + 'T23:59:59.000Z');
+
+  while (current <= end) {
+    const chunkEnd = new Date(current);
+    chunkEnd.setDate(chunkEnd.getDate() + chunkDays - 1);
+    if (chunkEnd > end) chunkEnd.setTime(end.getTime());
+
+    ranges.push({
+      from: current.toISOString().split('T')[0],
+      to: chunkEnd.toISOString().split('T')[0],
+    });
+
+    current = new Date(chunkEnd);
+    current.setDate(current.getDate() + 1);
+  }
+
+  return ranges;
+}
+
+/**
+ * 단일 날짜 구간에서 상태별 주문 건수 조회
+ * lastChangedStatuses API 사용 (변경 상품 주문 내역 조회)
+ */
+async function getOrderCountInRange(token: string, statuses: string[], fromDate: string, toDate: string): Promise<number> {
   try {
-    const statusParam = statuses.map(s => 'productOrderStatuses=' + s).join('&');
+    const statusParam = statuses.map(s => 'orderStatuses=' + s).join('&');
     const url =
-      'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders?' +
-      'paymentDateFrom=' + fromDate + 'T00:00:00.000Z&' +
-      'paymentDateTo=' + toDate + 'T23:59:59.000Z&' +
+      'https://api.commerce.naver.com/external/v1/pay-order/seller/orders/last-changed-statuses?' +
+      'lastChangedFrom=' + fromDate + 'T00:00:00.000Z&' +
+      'lastChangedTo=' + toDate + 'T23:59:59.000Z&' +
       statusParam + '&page=1&pageSize=1';
 
     const res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
     const data = await res.json() as any;
-
-    // 응답 구조 로깅 (디버그용)
-    console.log(`[주문조회] 상태:${statuses.join(',')} → totalCount:${data.totalCount} count:${data.count}`);
-
-    // API가 에러 반환 시 lastChangedStatuses로 fallback
-    if (data.code && data.code !== 200) {
-      console.warn(`[주문조회] product-orders 실패(${data.code}), lastChangedStatuses로 fallback`);
-      return await getOrderCountFallback(token, statuses, fromDate, toDate);
-    }
-
-    return data.totalCount || data.count || 0;
+    return data.totalCount || 0;
   } catch (e) {
-    console.error('[주문조회] 오류:', e);
+    console.error('[주문조회] 구간 오류:', e);
     return 0;
   }
 }
 
 /**
- * Fallback: lastChangedStatuses API (기존 방식)
- * product-orders API 실패 시 사용
+ * 전체 기간(90일)을 30일 구간으로 나눠 조회 후 합산
+ * → 스마트스토어 앱 현황판과 동일한 누적 건수 반환
  */
-async function getOrderCountFallback(token: string, statuses: string[], fromDate: string, toDate: string): Promise<number> {
-  try {
-    const statusParam = statuses.map(s => 'orderStatuses=' + s).join('&');
-    const res = await fetch(
-      'https://api.commerce.naver.com/external/v1/pay-order/seller/orders/last-changed-statuses?' +
-      'lastChangedFrom=' + fromDate + 'T00:00:00.000Z&lastChangedTo=' + toDate + 'T23:59:59.000Z&' +
-      statusParam + '&page=1&pageSize=1',
-      { headers: { 'Authorization': 'Bearer ' + token } });
-    const data = await res.json() as any;
-    return data.totalCount || 0;
-  } catch (e) { return 0; }
+async function getOrderCountByStatus(token: string, statuses: string[], fromDate: string, toDate: string): Promise<number> {
+  const ranges = splitDateRanges(fromDate, toDate, 30);
+  let total = 0;
+
+  for (const range of ranges) {
+    const count = await getOrderCountInRange(token, statuses, range.from, range.to);
+    total += count;
+    console.log(`[주문조회] 상태:${statuses.join(',')} 구간:${range.from}~${range.to} → ${count}건`);
+  }
+
+  console.log(`[주문조회] 상태:${statuses.join(',')} 합계 → ${total}건`);
+  return total;
 }
 
 export async function getNewOrderDetails(token: string, fromDate: string, toDate: string) {
   try {
-    // 신규 주문(PAYED) 상세는 product-orders API 사용
-    const url =
-      'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders?' +
-      'paymentDateFrom=' + fromDate + 'T00:00:00.000Z&' +
-      'paymentDateTo=' + toDate + 'T23:59:59.000Z&' +
-      'productOrderStatuses=PAYED&page=1&pageSize=100';
-
-    const res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
+    const res = await fetch(
+      'https://api.commerce.naver.com/external/v1/pay-order/seller/orders/last-changed-statuses?' +
+      'lastChangedFrom=' + fromDate + 'T00:00:00.000Z&lastChangedTo=' + toDate + 'T23:59:59.000Z&' +
+      'orderStatuses=PAYED&page=1&pageSize=100',
+      { headers: { 'Authorization': 'Bearer ' + token } });
     const data = await res.json() as any;
-
-    // product-orders 응답 구조: data.productOrders 또는 data.data
-    const orders = data.productOrders || data.data?.lastChangeStatuses || data.data || [];
-    console.log('[신규주문] 조회 건수:', orders.length);
-    return orders;
+    return data.data?.lastChangeStatuses || [];
   } catch (e) { console.error('[신규주문 상세조회] 오류:', e); return []; }
 }
 
@@ -205,18 +213,20 @@ export async function runDailyOrderReport() {
       console.error('[스케줄러] 토큰 발급 실패 - 보고 중단');
       return;
     }
+
     const kstOffset = 9 * 60 * 60 * 1000;
     const kstNow = new Date(Date.now() + kstOffset);
-    const todayKST = kstNow.toISOString().split('T')[0];
+    const todayKST = toKSTDateStr(kstNow);
     const yesterday = new Date(kstNow);
     yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayKST = yesterday.toISOString().split('T')[0];
+    const yesterdayKST = toKSTDateStr(yesterday);
 
-    // 현재 진행중인 모든 주문 포함을 위해 90일 범위 사용
-    // (배송중/배송완료는 30일 이전 결제 주문도 포함될 수 있음)
+    // 90일 전부터 오늘까지 전체 구간 조회 (30일씩 3구간으로 분할)
     const ninetyDaysAgo = new Date(kstNow);
     ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
-    const ninetyDaysAgoKST = ninetyDaysAgo.toISOString().split('T')[0];
+    const ninetyDaysAgoKST = toKSTDateStr(ninetyDaysAgo);
+
+    console.log(`[스케줄러] 조회 기간: ${ninetyDaysAgoKST} ~ ${todayKST}`);
 
     const [newOrderCount, dispatchCount, deliveringCount, deliveredCount, confirmedCount, settlement] = await Promise.all([
       getOrderCountByStatus(token, ['PAYED'], ninetyDaysAgoKST, todayKST),
@@ -227,8 +237,13 @@ export async function runDailyOrderReport() {
       getDailySettlement(token, yesterdayKST),
     ]);
 
+    // 신규 주문 상세는 최근 30일만 조회 (발주서 발송 목적)
+    const thirtyDaysAgo = new Date(kstNow);
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const thirtyDaysAgoKST = toKSTDateStr(thirtyDaysAgo);
+
     let newOrders: any[] = [];
-    if (newOrderCount > 0) newOrders = await getNewOrderDetails(token, ninetyDaysAgoKST, todayKST);
+    if (newOrderCount > 0) newOrders = await getNewOrderDetails(token, thirtyDaysAgoKST, todayKST);
 
     let message = '📊 <b>[자동 보고] ' + todayKST + ' 현황</b>\n';
     message += '━━━━━━━━━━━━━━━\n';
@@ -253,7 +268,7 @@ export async function runDailyOrderReport() {
       const bamOrders: Record<string, number> = {};
       const cornOrders: Record<string, number> = {};
       for (const order of newOrders) {
-        const optionName = order.productOption || order.productName || order.productTitle || '';
+        const optionName = order.productOption || order.productName || '';
         const isCorn = optionName.includes('옥수수') || optionName.includes('옥광') || optionName.includes('3X') || optionName.includes('찰옥');
         if (isCorn) cornOrders[optionName] = (cornOrders[optionName] || 0) + (order.quantity || 1);
         else bamOrders[optionName] = (bamOrders[optionName] || 0) + (order.quantity || 1);
