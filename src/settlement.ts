@@ -322,3 +322,85 @@ export function calcCostSummary(bamOrders: OrderItem[], cornOrders: OrderItem[])
 
   return msg;
 }
+
+// ─── 통합주문서 파싱 ───
+export interface ParsedOrderSheet {
+  bamOrders: OrderItem[];
+  cornOrders: OrderItem[];
+  unknownOrders: OrderItem[];
+  totalCount: number;
+}
+
+export function parseNaverOrderSheet(fileBuffer: Buffer, password: string = '1234'): ParsedOrderSheet {
+  let wb: XLSX.WorkBook;
+  try {
+    wb = XLSX.read(fileBuffer, { type: 'buffer', password });
+  } catch {
+    wb = XLSX.read(fileBuffer, { type: 'buffer' });
+  }
+
+  const sheetName = wb.SheetNames.includes('발주발송관리')
+    ? '발주발송관리'
+    : wb.SheetNames[0];
+  const ws = wb.Sheets[sheetName];
+  const rows: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }) as any[][];
+
+  let headerRowIdx = -1;
+  for (let i = 0; i < Math.min(rows.length, 5); i++) {
+    if (rows[i] && rows[i].some((v: any) => String(v).includes('상품주문번호'))) {
+      headerRowIdx = i;
+      break;
+    }
+  }
+  if (headerRowIdx === -1) headerRowIdx = 1;
+
+  const headers: string[] = rows[headerRowIdx].map((v: any) => String(v || ''));
+  const colIdx = (name: string) => headers.findIndex(h => h.includes(name));
+
+  const idxOrderId  = colIdx('상품주문번호');
+  const idxReceiver = colIdx('수취인명');
+  const idxOption   = colIdx('옵션정보');
+  const idxQty      = colIdx('수량');
+  const idxPhone    = colIdx('수취인연락처1');
+  const idxAddress  = colIdx('통합배송지');
+
+  const bamOrders: OrderItem[] = [];
+  const cornOrders: OrderItem[] = [];
+  const unknownOrders: OrderItem[] = [];
+
+  for (let i = headerRowIdx + 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row || !row.some((v: any) => v !== '' && v !== null && v !== undefined)) continue;
+
+    const orderId  = String(row[idxOrderId] || '').replace(/\.0$/, '');
+    const receiver = String(row[idxReceiver] || '');
+    const option   = String(row[idxOption] || '');
+    const qty      = Number(row[idxQty]) || 1;
+    const phone    = String(row[idxPhone] || '');
+    const address  = String(row[idxAddress] || '');
+
+    if (!option && !receiver) continue;
+
+    const item: OrderItem = {
+      productName: option,
+      productOption: option,
+      quantity: qty,
+      orderId,
+      receiverName: receiver,
+      receiverPhone: phone,
+      address,
+      senderName: '셀렌',
+      senderPhone: process.env.SENDER_PHONE || '010-9943-3201',
+    };
+
+    if (isCornProduct(option)) {
+      cornOrders.push(item);
+    } else if (option.includes('밤') || option.includes('포르단') || option.includes('알밤') || option.includes('옥광') || option.includes('대보')) {
+      bamOrders.push(item);
+    } else {
+      unknownOrders.push(item);
+    }
+  }
+
+  return { bamOrders, cornOrders, unknownOrders, totalCount: bamOrders.length + cornOrders.length + unknownOrders.length };
+}
