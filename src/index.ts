@@ -491,6 +491,147 @@ app.post('/telegram-webhook', async (req, res) => {
           '❓ 알 수 없는 명령어입니다.\n' +
           '/help 를 입력하면 전체 명령어를 확인할 수 있습니다.'
         );
+
+      // ── 자연어 인식 ──
+      } else if (text.length > 0) {
+        const t = text.toLowerCase();
+
+        // 전체 현황 / 리포트
+        if (
+          t.includes('현황') ||
+          t.includes('리포트') ||
+          t.includes('report') ||
+          t.includes('전체') ||
+          (t.includes('주문') && (t.includes('얼마') || t.includes('몇') || t.includes('알려') || t.includes('보여') || t.includes('상태') || t.includes('현재') || t.includes('어때') || t.includes('어떻')))
+        ) {
+          broadcastEvent({ type: 'node_active', node: 'brain', message: '자연어 현황 요청 수신', progress: 0, flow: ['telegram->brain'] });
+          await sendTelegram('🔄 전체 현황을 조회하고 있습니다...');
+          await runDailyOrderReport();
+          broadcastEvent({ type: 'node_complete', node: 'brain', message: '주문 현황 조회 완료', progress: 100 });
+
+        // 오늘 주문
+        } else if (
+          (t.includes('오늘') && t.includes('주문')) ||
+          t.includes('today') ||
+          (t.includes('오늘') && (t.includes('몇') || t.includes('얼마') || t.includes('들어')))
+        ) {
+          broadcastEvent({ type: 'node_active', node: 'smartstore', message: '자연어 오늘 주문 요청', progress: 20, flow: ['telegram->brain', 'brain->smartstore'] });
+          await sendTelegram('🔄 오늘 신규 주문을 조회하고 있습니다...');
+          try {
+            const token = await getSmartStoreToken();
+            if (!token) { await sendTelegram('❌ 스마트스토어 인증 실패'); return; }
+            const orders = await getNewOrderDetails(token, todayKST, todayKST);
+            if (orders.length === 0) {
+              await sendTelegram('📭 오늘(' + todayKST + ') 신규 주문이 없습니다.');
+            } else {
+              const bamOrders: Record<string, number> = {};
+              const cornOrders: Record<string, number> = {};
+              for (const order of orders) {
+                const opt = order.productOption || order.productName || '기타';
+                const isCorn = opt.includes('옥수수') || opt.includes('옥광') || opt.includes('3X') || opt.includes('찰옥');
+                if (isCorn) cornOrders[opt] = (cornOrders[opt] || 0) + (order.quantity || 1);
+                else bamOrders[opt] = (bamOrders[opt] || 0) + (order.quantity || 1);
+              }
+              let msg = '🛒 <b>오늘(' + todayKST + ') 신규 주문</b>\n';
+              msg += '━━━━━━━━━━━━━━━\n';
+              msg += '📦 총 <b>' + orders.length + '건</b>\n\n';
+              if (Object.keys(bamOrders).length > 0) {
+                msg += '🌰 <b>밤</b>\n';
+                for (const [name, qty] of Object.entries(bamOrders)) msg += '  • ' + name + ': ' + qty + '개\n';
+              }
+              if (Object.keys(cornOrders).length > 0) {
+                msg += '🌽 <b>옥수수</b>\n';
+                for (const [name, qty] of Object.entries(cornOrders)) msg += '  • ' + name + ': ' + qty + '개\n';
+              }
+              await sendTelegram(msg, {
+                inline_keyboard: [[
+                  { text: '📋 발주서 발송', callback_data: 'confirm_dispatch_' + todayKST },
+                ]]
+              });
+            }
+          } catch (e) {
+            await sendTelegram('❌ 오늘 주문 조회 실패\n' + String(e));
+          }
+
+        // 주문 목록
+        } else if (
+          t.includes('목록') ||
+          t.includes('리스트') ||
+          t.includes('list') ||
+          (t.includes('주문') && (t.includes('뭐') || t.includes('뭔') || t.includes('어떤')))
+        ) {
+          broadcastEvent({ type: 'node_active', node: 'smartstore', message: '자연어 주문 목록 요청', progress: 20, flow: ['telegram->brain', 'brain->smartstore'] });
+          await sendTelegram('🔄 처리 중인 주문을 조회하고 있습니다...');
+          try {
+            const token = await getSmartStoreToken();
+            if (!token) { await sendTelegram('❌ 스마트스토어 인증 실패'); return; }
+            const orders = await getNewOrderDetails(token, yesterdayKST, todayKST);
+            if (orders.length === 0) {
+              await sendTelegram('📭 처리 중인 주문이 없습니다.');
+            } else {
+              let msg = '📋 <b>처리 중인 주문 목록</b>\n';
+              msg += '━━━━━━━━━━━━━━━\n';
+              for (const order of orders.slice(0, 20)) {
+                msg += '• ' + (order.productName || '') + ' ' + (order.productOption || '') + ' x' + (order.quantity || 1) + ' | ' + (order.receiverName || '') + '\n';
+              }
+              if (orders.length > 20) msg += '...외 ' + (orders.length - 20) + '건';
+              await sendTelegram(msg);
+            }
+          } catch (e) {
+            await sendTelegram('❌ 주문 목록 조회 실패\n' + String(e));
+          }
+
+        // 정산
+        } else if (t.includes('정산') || t.includes('매출') || t.includes('수익') || t.includes('얼마 벌')) {
+          broadcastEvent({ type: 'node_active', node: 'smartstore', message: '자연어 정산 요청', progress: 20, flow: ['telegram->brain', 'brain->smartstore'] });
+          await sendTelegram('🔄 ' + yesterdayKST + ' 정산 내역을 조회하고 있습니다...');
+          try {
+            const token = await getSmartStoreToken();
+            if (!token) { await sendTelegram('❌ 스마트스토어 인증 실패'); return; }
+            const settlement = await getDailySettlement(token, yesterdayKST);
+            if (!settlement || settlement.settleAmount === 0) {
+              await sendTelegram('💰 ' + yesterdayKST + ' 정산 내역이 없습니다.');
+            } else {
+              await sendTelegram(
+                '💰 <b>' + yesterdayKST + ' 정산 내역</b>\n' +
+                '━━━━━━━━━━━━━━━\n' +
+                '정산 금액: <b>' + settlement.settleAmount.toLocaleString('ko-KR') + '원</b>\n' +
+                '정산 건수: <b>' + settlement.settleCount + '건</b>\n' +
+                '━━━━━━━━━━━━━━━'
+              );
+            }
+          } catch (e) {
+            await sendTelegram('❌ 정산 조회 실패\n' + String(e));
+          }
+
+        // 도움말
+        } else if (t.includes('도움') || t.includes('help') || t.includes('뭐') || t.includes('기능') || t.includes('명령')) {
+          await sendTelegram(
+            '안녕하세요! 저는 자비스입니다 🤖\n\n' +
+            '이렇게 말씀해 주세요:\n' +
+            '• "현황 알려줘" → 전체 주문 현황\n' +
+            '• "오늘 주문 몇 개야?" → 오늘 신규 주문\n' +
+            '• "주문 목록 보여줘" → 처리 중 주문 목록\n' +
+            '• "정산 얼마야?" → 어제 정산 내역\n\n' +
+            '또는 슬래시 명령어:\n' +
+            '/report /today /orders /settle /status'
+          );
+
+        // 인사
+        } else if (t.includes('안녕') || t.includes('hello') || t.includes('hi') || t === 'ㅎㅇ') {
+          await sendTelegram('안녕하세요! 자비스입니다 🤖\n무엇을 도와드릴까요?\n"현황 알려줘" 또는 "오늘 주문 몇 개야?" 라고 말씀해 보세요!');
+
+        // 그 외
+        } else {
+          await sendTelegram(
+            '죄송합니다, 잘 이해하지 못했습니다 😅\n\n' +
+            '이렇게 말씀해 주세요:\n' +
+            '• "현황 알려줘"\n' +
+            '• "오늘 주문 몇 개야?"\n' +
+            '• "주문 목록 보여줘"\n\n' +
+            '또는 /help 를 입력해 주세요.'
+          );
+        }
       }
     }
   } catch (e) {
