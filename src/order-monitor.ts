@@ -1,20 +1,24 @@
 // 실시간 주문 모니터 - 5분마다 스마트스토어 주문 상태 변화 감지
 // 새 주문 또는 상태 변경 시 텔레그램으로 즉시 알림
-// ★ 모든 네이버 API 호출은 Quotaguard 프록시 경유 → 고정 IP 보장
+// ★ Node.js 내장 fetch는 agent를 무시함 → axios 사용으로 프록시 확실 적용
 
+import axios, { AxiosRequestConfig } from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { getSmartStoreToken, sendTelegram } from './smartstore-scheduler.js';
 
 /**
- * 네이버 커머스 API 전용 fetch 래퍼 (프록시 경유)
+ * 네이버 커머스 API 전용 GET (axios + 프록시)
  */
-function naverFetch(url: string, options: RequestInit = {}): Promise<Response> {
+async function naverGet(url: string, headers: Record<string, string> = {}): Promise<any> {
   const proxyUrl = process.env.QUOTAGUARDSTATIC_URL;
-  const fetchOptions: any = { ...options };
+  const config: AxiosRequestConfig = { url, method: 'GET', headers };
   if (proxyUrl) {
-    fetchOptions.agent = new HttpsProxyAgent(proxyUrl);
+    const agent = new HttpsProxyAgent(proxyUrl);
+    config.httpsAgent = agent;
+    config.httpAgent = agent;
   }
-  return fetch(url, fetchOptions);
+  const res = await axios(config);
+  return res.data;
 }
 
 interface OrderSnapshot {
@@ -64,14 +68,13 @@ async function fetchRecentOrders(token: string): Promise<OrderSnapshot[]> {
 
     for (const status of statuses) {
       try {
-        // ★ 프록시 경유
-        const res = await naverFetch(
+        // ★ axios + 프록시 경유
+        const data = await naverGet(
           `https://api.commerce.naver.com/external/v1/pay-order/seller/orders/last-changed-statuses?` +
           `lastChangedFrom=${fromDate}T00:00:00.000Z&lastChangedTo=${toDate}T23:59:59.000Z&` +
           `orderStatuses=${status}&page=1&pageSize=100`,
-          { headers: { 'Authorization': 'Bearer ' + token } }
+          { 'Authorization': 'Bearer ' + token }
         );
-        const data = await res.json() as any;
         const orders = data.data?.lastChangeStatuses || [];
         for (const o of orders) {
           allOrders.push({

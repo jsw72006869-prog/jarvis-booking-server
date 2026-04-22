@@ -2,15 +2,14 @@
 // 매일 아침 9시(한국시간)에 자동으로 스마트스토어 주문/정산 현황을 조회하고
 // 텔레그램으로 보고합니다.
 // 인증 방식: bcrypt (네이버 커머스API 공식 방식)
-// 핵심: 모든 네이버 API 호출은 Quotaguard Static 프록시를 통해 고정 IP로 나감
+// ★ 핵심: Node.js 내장 fetch는 agent를 무시함 → axios 사용으로 프록시 확실 적용
 
+import axios, { AxiosRequestConfig } from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { getCachedToken, setCachedToken, handleTokenFailure } from './ip-manager';
 
 /**
  * Quotaguard Static 프록시 에이전트 생성
- * 환경변수 QUOTAGUARDSTATIC_URL이 설정되어 있으면 프록시 사용
- * 없으면 직접 연결 (개발 환경)
  */
 function getProxyAgent(): HttpsProxyAgent<string> | undefined {
   const proxyUrl = process.env.QUOTAGUARDSTATIC_URL;
@@ -21,17 +20,33 @@ function getProxyAgent(): HttpsProxyAgent<string> | undefined {
 }
 
 /**
- * 네이버 커머스 API 전용 fetch 래퍼
- * 항상 Quotaguard 프록시를 통해 호출 → 고정 IP 보장
+ * 네이버 커머스 API 전용 GET (axios + 프록시)
  */
-async function naverFetch(url: string, options: RequestInit = {}): Promise<Response> {
+async function naverGet(url: string, headers: Record<string, string> = {}): Promise<any> {
   const agent = getProxyAgent();
-  const fetchOptions: any = { ...options };
+  const config: AxiosRequestConfig = { url, method: 'GET', headers };
   if (agent) {
-    fetchOptions.agent = agent;
-    console.log('[프록시] Quotaguard 경유 →', url.substring(0, 80));
+    config.httpsAgent = agent;
+    config.httpAgent = agent;
+    console.log('[프록시] Quotaguard GET →', url.substring(0, 80));
   }
-  return fetch(url, fetchOptions);
+  const res = await axios(config);
+  return res.data;
+}
+
+/**
+ * 네이버 커머스 API 전용 POST (axios + 프록시)
+ */
+async function naverPost(url: string, data?: any, headers: Record<string, string> = {}): Promise<any> {
+  const agent = getProxyAgent();
+  const config: AxiosRequestConfig = { url, method: 'POST', headers, data };
+  if (agent) {
+    config.httpsAgent = agent;
+    config.httpAgent = agent;
+    console.log('[프록시] Quotaguard POST →', url.substring(0, 80));
+  }
+  const res = await axios(config);
+  return res.data;
 }
 
 export async function sendTelegram(message: string, replyMarkup?: any) {
@@ -41,13 +56,9 @@ export async function sendTelegram(message: string, replyMarkup?: any) {
   try {
     const body: any = { chat_id: chatId, text: message, parse_mode: 'HTML' };
     if (replyMarkup) body.reply_markup = replyMarkup;
-    // 텔레그램은 IP 제한 없으므로 프록시 불필요 → 일반 fetch 사용
-    const res = await fetch('https://api.telegram.org/bot' + botToken + '/sendMessage', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json() as any;
+    // 텔레그램은 IP 제한 없으므로 프록시 불필요
+    const res = await axios.post('https://api.telegram.org/bot' + botToken + '/sendMessage', body);
+    const data = res.data;
     if (!data.ok) { console.error('[텔레그램] 발송 실패:', data.description); return null; }
     console.log('[텔레그램] 발송 성공 to chat_id:', chatId, 'message_id:', data.result?.message_id);
     return data.result?.message_id || null;
@@ -58,10 +69,8 @@ export async function answerCallbackQuery(callbackQueryId: string, text: string)
   const botToken = process.env.TELEGRAM_BOT_TOKEN || '';
   if (!botToken) return;
   try {
-    await fetch('https://api.telegram.org/bot' + botToken + '/answerCallbackQuery', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ callback_query_id: callbackQueryId, text, show_alert: false }),
+    await axios.post('https://api.telegram.org/bot' + botToken + '/answerCallbackQuery', {
+      callback_query_id: callbackQueryId, text, show_alert: false,
     });
   } catch (e) { console.error('[텔레그램] Callback 응답 오류:', e); }
 }
@@ -96,12 +105,12 @@ export async function getSmartStoreToken(): Promise<string | null> {
         type: 'SELF',
       });
 
-      // ★ 핵심: 토큰 발급도 프록시 경유 → 고정 IP로 나감
-      const response = await naverFetch(
+      // ★ 핵심: 토큰 발급도 axios + 프록시 경유 → 고정 IP로 나감
+      const data = await naverPost(
         'https://api.commerce.naver.com/external/v1/oauth2/token?' + params.toString(),
-        { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+        undefined,
+        { 'Content-Type': 'application/x-www-form-urlencoded' }
       );
-      const data = await response.json() as any;
 
       if (data.error || data.code) {
         const errCode = data.error || data.code || '';
@@ -117,9 +126,12 @@ export async function getSmartStoreToken(): Promise<string | null> {
         console.log('[토큰발급] 성공 ✅');
         return token;
       }
-    } catch (e) {
-      console.error(`[토큰발급] 오류 (시도 ${attempt}):`, e);
-      if (attempt === 2) await handleTokenFailure('NetworkError', String(e));
+    } catch (e: any) {
+      const errData = e.response?.data;
+      const errCode = errData?.error || errData?.code || '';
+      const errMsg = errData?.error_description || errData?.message || String(e);
+      console.error(`[토큰발급] 오류 (시도 ${attempt}):`, errCode, errMsg);
+      if (attempt === 2) await handleTokenFailure(errCode, errMsg);
     }
 
     if (attempt < 2) await new Promise(r => setTimeout(r, 1000));
@@ -163,9 +175,8 @@ async function getOrderCountInRange(token: string, statuses: string[], fromDate:
       'lastChangedTo=' + toDate + 'T23:59:59.000Z&' +
       statusParam + '&page=1&pageSize=1';
 
-    // ★ 프록시 경유
-    const res = await naverFetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
-    const data = await res.json() as any;
+    // ★ axios + 프록시 경유
+    const data = await naverGet(url, { 'Authorization': 'Bearer ' + token });
     return data.totalCount || 0;
   } catch (e) {
     console.error('[주문조회] 구간 오류:', e);
@@ -189,25 +200,23 @@ async function getOrderCountByStatus(token: string, statuses: string[], fromDate
 
 export async function getNewOrderDetails(token: string, fromDate: string, toDate: string) {
   try {
-    // ★ 프록시 경유
-    const res = await naverFetch(
+    // ★ axios + 프록시 경유
+    const data = await naverGet(
       'https://api.commerce.naver.com/external/v1/pay-order/seller/orders/last-changed-statuses?' +
       'lastChangedFrom=' + fromDate + 'T00:00:00.000Z&lastChangedTo=' + toDate + 'T23:59:59.000Z&' +
       'orderStatuses=PAYED&page=1&pageSize=100',
-      { headers: { 'Authorization': 'Bearer ' + token } });
-    const data = await res.json() as any;
+      { 'Authorization': 'Bearer ' + token });
     return data.data?.lastChangeStatuses || [];
   } catch (e) { console.error('[신규주문 상세조회] 오류:', e); return []; }
 }
 
 export async function getDailySettlement(token: string, settleDate: string) {
   try {
-    // ★ 프록시 경유
-    const res = await naverFetch(
+    // ★ axios + 프록시 경유
+    const data = await naverGet(
       'https://api.commerce.naver.com/external/v1/pay-settle/settle/daily?' +
       'settleStartDate=' + settleDate + '&settleEndDate=' + settleDate,
-      { headers: { 'Authorization': 'Bearer ' + token } });
-    const data = await res.json() as any;
+      { 'Authorization': 'Bearer ' + token });
     console.log('[정산조회] 응답:', JSON.stringify(data).substring(0, 300));
     if (data.data && Array.isArray(data.data) && data.data.length > 0) {
       let totalAmount = 0, totalCount = 0;
