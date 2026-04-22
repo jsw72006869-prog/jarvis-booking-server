@@ -3,7 +3,7 @@
 // 텔레그램으로 보고합니다.
 // 인증 방식: bcrypt (네이버 커머스API 공식 방식)
 // ★ 핵심: Node.js 내장 fetch는 agent를 무시함 → axios 사용으로 프록시 확실 적용
-// ★ 2026-04-22 최종 수정: "오늘 하루" 기준 조회 → API 호출 최소화 (1~2번)
+// ★ 2026-04-22 최종 수정: "오늘+어제" 기준 조회 → API 호출 최소화, 순차 호출
 
 import axios, { AxiosRequestConfig } from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -154,18 +154,20 @@ export async function getSmartStoreToken(): Promise<string | null> {
   return null;
 }
 
-function toKSTDateStr(date: Date): string {
-  return date.toISOString().split('T')[0];
+/**
+ * KST 날짜 문자열 생성 (YYYY-MM-DD)
+ * ★ 안전한 방식: Intl.DateTimeFormat 사용
+ */
+function getKSTDateStr(date?: Date): string {
+  const d = date || new Date();
+  const kst = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Seoul' }).format(d);
+  return kst; // 'YYYY-MM-DD' 형식
 }
 
 /**
  * ★ 핵심: 조건형 API로 "하루" 주문을 조회합니다.
  * from/to가 24시간 이내이므로 API 1번 호출로 끝남.
  * 페이징만 처리하면 됨.
- * 
- * @param token - 인증 토큰
- * @param dateStr - 조회할 날짜 (YYYY-MM-DD)
- * @param statusFilter - 특정 상태만 조회 (생략 시 전체)
  */
 async function getOrdersForOneDay(
   token: string,
@@ -178,8 +180,9 @@ async function getOrdersForOneDay(
 
   while (hasNext) {
     try {
-      const fromDT = dateStr + 'T00:00:00.000%2B09:00';
-      const toDT = dateStr + 'T23:59:59.000%2B09:00';
+      // ★ URL 인코딩: + 기호는 %2B로 인코딩해야 함
+      const fromDT = encodeURIComponent(dateStr + 'T00:00:00.000+09:00');
+      const toDT = encodeURIComponent(dateStr + 'T23:59:59.000+09:00');
       let url =
         'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders?' +
         'from=' + fromDT + '&' +
@@ -193,35 +196,61 @@ async function getOrdersForOneDay(
       }
 
       console.log(`[주문조회] ${dateStr} ${statusFilter || '전체'} page=${page} 호출`);
+      console.log(`[주문조회] URL: ${url}`);
       const data = await naverGet(url, { 'Authorization': 'Bearer ' + token });
 
-      // ★ 디버깅: API 응답 구조 로깅
-      console.log(`[주문조회] 응답 키:`, JSON.stringify(Object.keys(data || {})));
-      if (data?.data) {
-        console.log(`[주문조회] data 키:`, JSON.stringify(Object.keys(data.data)));
-        console.log(`[주문조회] contents 개수:`, (data.data.contents || []).length);
-        console.log(`[주문조회] pagination:`, JSON.stringify(data.data.pagination || {}));
+      // ★ 디버깅: API 응답 구조 상세 로깅
+      console.log(`[주문조회] 응답 최상위 키:`, JSON.stringify(Object.keys(data || {})));
+
+      // 응답 구조 탐색: data.data.contents 또는 data.contents 등 여러 경로 시도
+      let contents: any[] = [];
+      let pagination: any = null;
+
+      if (data?.data?.contents) {
+        contents = data.data.contents;
+        pagination = data.data.pagination;
+        console.log(`[주문조회] 경로: data.data.contents (${contents.length}건)`);
+      } else if (Array.isArray(data?.data)) {
+        contents = data.data;
+        console.log(`[주문조회] 경로: data.data (배열, ${contents.length}건)`);
+      } else if (data?.contents) {
+        contents = data.contents;
+        pagination = data.pagination;
+        console.log(`[주문조회] 경로: data.contents (${contents.length}건)`);
       } else {
-        // data.data가 없으면 응답 전체를 로깅 (처음 500자)
-        console.log(`[주문조회] 전체 응답:`, JSON.stringify(data).substring(0, 500));
+        console.log(`[주문조회] 전체 응답 (500자):`, JSON.stringify(data).substring(0, 500));
       }
 
-      const contents = data?.data?.contents || [];
-      const pagination = data?.data?.pagination;
+      // ★ 첫 번째 주문 항목 전체 구조 로깅 (디버깅용)
+      if (contents.length > 0 && page === 1) {
+        console.log(`[주문조회] 첫 번째 항목 전체:`, JSON.stringify(contents[0]).substring(0, 1000));
+      }
 
-      for (const order of contents) {
-        const po = order.productOrder || order;
+      for (const item of contents) {
+        // ★ 다양한 응답 구조 대응
+        // 구조1: { productOrderId, orderId, productOrderStatus, productOrder: { ... } }
+        // 구조2: { productOrder: { productOrderId, productOrderStatus, ... } }
+        // 구조3: 플랫 구조 { productOrderId, productOrderStatus, productName, ... }
+        const po = item.productOrder || {};
+        
+        // productOrderStatus를 여러 경로에서 탐색
+        let status = item.productOrderStatus 
+          || po.productOrderStatus 
+          || item.lastProductOrderStatus 
+          || po.lastProductOrderStatus
+          || 'UNKNOWN';
+
         orders.push({
-          productOrderId: order.productOrderId || po.productOrderId,
-          orderId: order.orderId || po.orderId,
-          productOrderStatus: order.productOrderStatus || po.productOrderStatus || 'UNKNOWN',
-          productName: po.productName || order.productName || '',
-          productOption: po.productOption || order.productOption || '',
-          quantity: po.quantity || order.quantity || 1,
-          totalPaymentAmount: po.totalPaymentAmount || order.totalPaymentAmount || 0,
-          buyerName: po.buyerName || order.buyerName || '',
-          receiverName: po.receiverName || order.receiverName || '',
-          paymentDate: po.paymentDate || order.paymentDate || '',
+          productOrderId: item.productOrderId || po.productOrderId || '',
+          orderId: item.orderId || po.orderId || '',
+          productOrderStatus: status,
+          productName: item.productName || po.productName || '',
+          productOption: item.productOption || po.productOption || '',
+          quantity: item.quantity || po.quantity || 1,
+          totalPaymentAmount: item.totalPaymentAmount || po.totalPaymentAmount || 0,
+          buyerName: item.buyerName || po.buyerName || '',
+          receiverName: item.receiverName || po.receiverName || '',
+          paymentDate: item.paymentDate || po.paymentDate || '',
         });
       }
 
@@ -229,8 +258,11 @@ async function getOrdersForOneDay(
       page++;
       if (page > 10) break;
     } catch (e: any) {
-      const errMsg = e.response?.data?.message || e.response?.data || e.message || String(e);
-      console.error(`[주문조회] ${dateStr} ${statusFilter || '전체'} page=${page} 오류:`, JSON.stringify(errMsg).substring(0, 300));
+      const status = e.response?.status;
+      const errData = e.response?.data;
+      console.error(`[주문조회] ${dateStr} ${statusFilter || '전체'} page=${page} 오류:`,
+        `status=${status}`,
+        JSON.stringify(errData || e.message || '').substring(0, 500));
       hasNext = false;
     }
   }
@@ -240,21 +272,17 @@ async function getOrdersForOneDay(
 }
 
 /**
- * 오늘 하루의 신규 주문(PAYED) 상세 정보를 조회합니다.
- * API 1번 호출로 완료됩니다.
+ * 오늘/어제의 신규 주문(PAYED) 상세 정보를 조회합니다.
  */
 export async function getNewOrderDetails(token: string, fromDate: string, toDate: string) {
-  // fromDate와 toDate가 같은 날이면 1번 호출
-  // 다른 날이면 각각 호출 (최대 2번)
   const allOrders: any[] = [];
-
   const dates: string[] = [fromDate];
   if (toDate !== fromDate) dates.push(toDate);
 
   for (const dateStr of dates) {
     const orders = await getOrdersForOneDay(token, dateStr, 'PAYED');
     allOrders.push(...orders);
-    if (dates.length > 1) await new Promise(r => setTimeout(r, 500));
+    if (dates.length > 1) await new Promise(r => setTimeout(r, 1000));
   }
 
   return allOrders;
@@ -281,12 +309,10 @@ export async function getDailySettlement(token: string, settleDate: string) {
 }
 
 /**
- * ★ /report 보고서: "오늘 하루" 기준 주문 현황
+ * ★ /report 보고서: "오늘+어제" 기준 주문 현황
  * 
- * API 호출 횟수: 최대 3번 (오늘 전체 주문 1번 + 어제 전체 주문 1번 + 정산 1번)
+ * API 호출: 순차 3번 (오늘 전체 → 어제 전체 → 정산)
  * → rate limit 문제 완전 해결
- * 
- * 오늘 결제된 주문을 상태별로 분류하여 보고합니다.
  */
 export async function runDailyOrderReport() {
   console.log('[스케줄러] 자동 주문 보고 시작...');
@@ -298,21 +324,27 @@ export async function runDailyOrderReport() {
       return;
     }
 
-    const kstOffset = 9 * 60 * 60 * 1000;
-    const kstNow = new Date(Date.now() + kstOffset);
-    const todayKST = toKSTDateStr(kstNow);
-    const yesterday = new Date(kstNow);
-    yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayKST = toKSTDateStr(yesterday);
+    // ★ 안전한 KST 날짜 계산
+    const todayKST = getKSTDateStr();
+    const yesterdayDate = new Date();
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+    const yesterdayKST = getKSTDateStr(yesterdayDate);
 
-    console.log(`[스케줄러] 오늘: ${todayKST}, 어제: ${yesterdayKST}`);
+    console.log(`[스케줄러] 오늘(KST): ${todayKST}, 어제(KST): ${yesterdayKST}`);
 
-    // ★ 핵심: API 3번만 호출 (오늘 전체 + 어제 전체 + 정산)
-    const [todayOrders, yesterdayOrders, settlement] = await Promise.all([
-      getOrdersForOneDay(token, todayKST),        // 오늘 전체 주문 (상태 무관)
-      getOrdersForOneDay(token, yesterdayKST),     // 어제 전체 주문 (상태 무관)
-      getDailySettlement(token, yesterdayKST),     // 어제 정산
-    ]);
+    // ★ 순차 호출 (rate limit 방지) - Promise.all 사용하지 않음
+    console.log('[스케줄러] 1/3 오늘 주문 조회...');
+    const todayOrders = await getOrdersForOneDay(token, todayKST);
+    
+    await new Promise(r => setTimeout(r, 1000)); // 1초 대기
+    
+    console.log('[스케줄러] 2/3 어제 주문 조회...');
+    const yesterdayOrders = await getOrdersForOneDay(token, yesterdayKST);
+    
+    await new Promise(r => setTimeout(r, 1000)); // 1초 대기
+    
+    console.log('[스케줄러] 3/3 정산 조회...');
+    const settlement = await getDailySettlement(token, yesterdayKST);
 
     // 오늘+어제 주문을 합쳐서 상태별 카운트
     const allOrders = [...todayOrders, ...yesterdayOrders];
@@ -328,10 +360,11 @@ export async function runDailyOrderReport() {
     const deliveredCount = statusCounts['DELIVERED'] || 0;
     const confirmedCount = statusCounts['PURCHASE_DECIDED'] || 0;
 
+    console.log(`[스케줄러] 오늘 주문: ${todayOrders.length}건, 어제 주문: ${yesterdayOrders.length}건`);
     console.log(`[스케줄러] 상태별 건수 - 신규:${newOrderCount} 배송준비:${dispatchCount} 배송중:${deliveringCount} 배송완료:${deliveredCount} 구매확정:${confirmedCount}`);
     console.log(`[스케줄러] 전체 상태 분포:`, JSON.stringify(statusCounts));
 
-    // 신규 주문(PAYED) 상세 - 이미 조회된 데이터에서 필터링 (추가 API 호출 불필요)
+    // 신규 주문(PAYED) 상세 - 이미 조회된 데이터에서 필터링
     const newOrders = allOrders.filter(o => o.productOrderStatus === 'PAYED');
 
     let message = '📊 <b>[자동 보고] ' + todayKST + ' 현황</b>\n';
