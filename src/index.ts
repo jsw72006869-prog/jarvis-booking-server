@@ -477,7 +477,7 @@ app.post('/telegram-webhook', async (req, res) => {
 
     // 일반 메시지 처리
     if (update.message) {
-      const text = (update.message.text || '').trim();
+      let text = (update.message.text || '').trim();
       const chatId = update.message.chat?.id;
 
       // ── 통합주문서 엑셀 파일 업로드 처리 ──
@@ -534,6 +534,57 @@ app.post('/telegram-webhook', async (req, res) => {
           return res.sendStatus(200);
         }
       }
+      // ── 음성 메시지 처리 (OpenAI Whisper) ──
+      if (update.message.voice || update.message.audio) {
+        const voiceObj = update.message.voice || update.message.audio;
+        await sendTelegram('🎤 음성 메시지를 인식하고 있습니다...');
+        try {
+          const botToken = process.env.TELEGRAM_BOT_TOKEN || '';
+          const openaiKey = process.env.OPENAI_API_KEY || '';
+          if (!openaiKey) {
+            await sendTelegram('❌ OpenAI API 키가 설정되지 않았습니다.\nRailway 환경변수에 OPENAI_API_KEY를 추가해주세요.');
+            return res.sendStatus(200);
+          }
+          // 파일 정보 조회
+          const fileInfoRes = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${voiceObj.file_id}`);
+          const fileInfo = await fileInfoRes.json() as any;
+          const filePath = fileInfo.result?.file_path;
+          if (!filePath) throw new Error('음성 파일 경로를 가져올 수 없습니다');
+          // 파일 다운로드
+          const fileRes = await fetch(`https://api.telegram.org/file/bot${botToken}/${filePath}`);
+          const audioBuffer = Buffer.from(await fileRes.arrayBuffer());
+
+          // Whisper API로 음성 → 텍스트 변환
+          const FormData = (await import('form-data')).default;
+          const formData = new FormData();
+          formData.append('file', audioBuffer, { filename: 'voice.oga', contentType: 'audio/ogg' });
+          formData.append('model', 'whisper-1');
+          formData.append('language', 'ko');
+
+          const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${openaiKey}`, ...formData.getHeaders() },
+            body: formData as any,
+          });
+          const whisperData = await whisperRes.json() as any;
+          const transcribedText = (whisperData.text || '').trim();
+
+          if (!transcribedText) {
+            await sendTelegram('❌ 음성 인식에 실패했습니다. 다시 시도해주세요.');
+            return res.sendStatus(200);
+          }
+
+          await sendTelegram(`🎤 음성 인식 완료: "<b>${transcribedText}</b>"\n\n처리 중...`);
+
+          // 인식된 텍스트를 자연어 처리로 전달
+          update.message.text = transcribedText;
+          text = transcribedText; // text 변수도 업데이트
+        } catch (e) {
+          await sendTelegram('❌ 음성 처리 오류: ' + String(e));
+          return res.sendStatus(200);
+        }
+      }
+
       console.log('[Webhook] 메시지:', text, 'from chat_id:', chatId);
 
       // KST 날짜 헬퍼
