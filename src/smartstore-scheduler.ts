@@ -227,30 +227,38 @@ async function getOrdersForOneDay(
       }
 
       for (const item of contents) {
-        // ★ 다양한 응답 구조 대응
-        // 구조1: { productOrderId, orderId, productOrderStatus, productOrder: { ... } }
-        // 구조2: { productOrder: { productOrderId, productOrderStatus, ... } }
-        // 구조3: 플랫 구조 { productOrderId, productOrderStatus, productName, ... }
+        // ★ 실제 API 응답 구조 (2026-04-22 로그에서 확인):
+        // contents[i] = {
+        //   productOrderId: "...",
+        //   content: {
+        //     order: { orderId, orderDate, ... },
+        //     productOrder: { productOrderId, productOrderStatus, productName, quantity, ... }
+        //   }
+        // }
+        const contentPO = item.content?.productOrder || {};
+        const contentOrder = item.content?.order || {};
         const po = item.productOrder || {};
         
-        // productOrderStatus를 여러 경로에서 탐색
-        let status = item.productOrderStatus 
+        // productOrderStatus를 여러 경로에서 탐색 (content.productOrder 우선)
+        let status = contentPO.productOrderStatus
+          || item.productOrderStatus 
           || po.productOrderStatus 
+          || contentPO.lastProductOrderStatus
           || item.lastProductOrderStatus 
           || po.lastProductOrderStatus
           || 'UNKNOWN';
 
         orders.push({
-          productOrderId: item.productOrderId || po.productOrderId || '',
-          orderId: item.orderId || po.orderId || '',
+          productOrderId: item.productOrderId || contentPO.productOrderId || po.productOrderId || '',
+          orderId: contentOrder.orderId || item.orderId || po.orderId || '',
           productOrderStatus: status,
-          productName: item.productName || po.productName || '',
-          productOption: item.productOption || po.productOption || '',
-          quantity: item.quantity || po.quantity || 1,
-          totalPaymentAmount: item.totalPaymentAmount || po.totalPaymentAmount || 0,
-          buyerName: item.buyerName || po.buyerName || '',
-          receiverName: item.receiverName || po.receiverName || '',
-          paymentDate: item.paymentDate || po.paymentDate || '',
+          productName: contentPO.productName || item.productName || po.productName || '',
+          productOption: contentPO.productOption || item.productOption || po.productOption || '',
+          quantity: contentPO.quantity || item.quantity || po.quantity || 1,
+          totalPaymentAmount: contentPO.totalPaymentAmount || item.totalPaymentAmount || po.totalPaymentAmount || 0,
+          buyerName: contentOrder.buyerName || item.buyerName || po.buyerName || '',
+          receiverName: contentPO.shippingAddress?.name || item.receiverName || po.receiverName || '',
+          paymentDate: contentPO.paymentDate || contentOrder.orderDate || item.paymentDate || po.paymentDate || '',
         });
       }
 
