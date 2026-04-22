@@ -1,4 +1,5 @@
 import express from 'express';
+import { generateSettlementXlsx, generateDispatchXlsx, calcCostSummary, type OrderItem } from './settlement';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { bookingRouter } from './routes/booking';
@@ -191,34 +192,81 @@ app.post('/telegram-webhook', async (req, res) => {
           const orders = await getNewOrderDetails(token, dateStr, dateStr);
           broadcastEvent({ type: 'node_complete', node: 'smartstore', message: `주문 ${orders.length}건 조회 완료`, progress: 50, flow: ['brain->smartstore'] });
 
-          // 발주서 HTML 이메일 구성
-          let htmlBody = '<h2>📦 ' + dateStr + ' 발주서</h2><table border="1" cellpadding="8" style="border-collapse:collapse;width:100%">';
-          htmlBody += '<tr style="background:#f0f0f0"><th>상품명/옵션</th><th>수량</th><th>주문번호</th><th>수령인</th></tr>';
-          for (const order of orders) {
-            htmlBody += '<tr><td>' + (order.productName || '') + ' ' + (order.productOption || '') + '</td>';
-            htmlBody += '<td>' + (order.quantity || 1) + '</td>';
-            htmlBody += '<td>' + (order.orderId || '') + '</td>';
-            htmlBody += '<td>' + (order.receiverName || '') + '</td></tr>';
-          }
-          htmlBody += '</table><p>총 ' + orders.length + '건</p>';
+          // 상품 분류
+          const orderItems: OrderItem[] = orders.map((o: any) => ({
+            productName: o.productName || '',
+            productOption: o.productOption || '',
+            quantity: o.quantity || 1,
+            orderId: o.orderId || '',
+            receiverName: o.receiverName || '',
+            receiverPhone: o.receiverPhone || '',
+            address: o.address || '',
+            senderName: '이혜안',
+            senderPhone: process.env.SENDER_PHONE || '',
+          }));
+          const bamItems = orderItems.filter(o => {
+            const opt = o.productOption || o.productName;
+            return !(opt.includes('옥수수') || opt.includes('3X') || opt.includes('3x') || opt.includes('찰옥'));
+          });
+          const cornItems = orderItems.filter(o => {
+            const opt = o.productOption || o.productName;
+            return opt.includes('옥수수') || opt.includes('3X') || opt.includes('3x') || opt.includes('찰옥');
+          });
 
-          broadcastEvent({ type: 'node_active', node: 'email', message: '발주서 이메일 발송 중...', progress: 70, flow: ['brain->email'] });
+          // 발주서 엑셀 생성
+          const dispatchXlsx = generateDispatchXlsx(dateStr, orderItems);
+
+          // 정산서 엑셀 생성
+          const attachments: any[] = [
+            { filename: dateStr + '_발주서.xlsx', content: dispatchXlsx, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+          ];
+          if (bamItems.length > 0) {
+            const bamSettlement = generateSettlementXlsx(dateStr, bamItems, 'bam');
+            attachments.push({ filename: dateStr + '_밤정산서.xlsx', content: bamSettlement.xlsxBuffer, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+          }
+          if (cornItems.length > 0) {
+            const cornSettlement = generateSettlementXlsx(dateStr, cornItems, 'corn');
+            attachments.push({ filename: dateStr + '_옥수수정산서.xlsx', content: cornSettlement.xlsxBuffer, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+          }
+
+          // 원가 계산 요약
+          const costSummary = calcCostSummary(orderItems);
+
+          // 이메일 HTML 본문
+          let htmlBody = '<h2>📦 ' + dateStr + ' 발주서</h2>';
+          htmlBody += '<table border="1" cellpadding="8" style="border-collapse:collapse;width:100%">';
+          htmlBody += '<tr style="background:#f0f0f0"><th>옵션정보</th><th>수량</th><th>수취인</th><th>연락처</th><th>주소</th></tr>';
+          for (const order of orderItems) {
+            htmlBody += '<tr><td>' + (order.productOption || order.productName) + '</td>';
+            htmlBody += '<td>' + order.quantity + '</td>';
+            htmlBody += '<td>' + order.receiverName + '</td>';
+            htmlBody += '<td>' + order.receiverPhone + '</td>';
+            htmlBody += '<td>' + order.address + '</td></tr>';
+          }
+          htmlBody += '</table><p>총 ' + orders.length + '건 | 엑셀 파일 첨부됨</p>';
+
+          broadcastEvent({ type: 'node_active', node: 'email', message: '발주서+정산서 이메일 발송 중...', progress: 70, flow: ['brain->email'] });
           const { sendEmailNotification } = await import('./email');
           await sendEmailNotification({
             to: process.env.DISPATCH_EMAIL || 'jungsng805@naver.com',
-            subject: '[자비스] ' + dateStr + ' 발주서 (' + orders.length + '건)',
+            subject: '[자비스] ' + dateStr + ' 발주서+정산서 (' + orders.length + '건)',
             html: htmlBody,
+            attachments,
           });
-          broadcastEvent({ type: 'node_complete', node: 'email', message: '발주서 이메일 발송 완료', progress: 85, flow: ['brain->email'] });
+          broadcastEvent({ type: 'node_complete', node: 'email', message: '발주서+정산서 이메일 발송 완료', progress: 85, flow: ['brain->email'] });
 
           broadcastEvent({ type: 'node_active', node: 'telegram', message: '발주서 완료 알림 발송 중...', progress: 90, flow: ['brain->telegram'] });
           await sendTelegram(
-            '✅ <b>발주서 이메일 발송 완료</b>\n' +
+            '✅ <b>발주서+정산서 이메일 발송 완료</b>\n' +
             '━━━━━━━━━━━━━━━\n' +
             '📅 날짜: ' + dateStr + '\n' +
             '📦 주문 수: <b>' + orders.length + '건</b>\n' +
+            (bamItems.length > 0 ? '🌰 밤: ' + bamItems.length + '건\n' : '') +
+            (cornItems.length > 0 ? '🌽 옥수수: ' + cornItems.length + '건\n' : '') +
+            '📎 첨부: 발주서.xlsx' + (bamItems.length > 0 ? ' + 밤정산서.xlsx' : '') + (cornItems.length > 0 ? ' + 옥수수정산서.xlsx' : '') + '\n' +
             '📧 발송처: ' + (process.env.DISPATCH_EMAIL || 'jungsng805@naver.com') + '\n' +
-            '━━━━━━━━━━━━━━━'
+            '━━━━━━━━━━━━━━━' +
+            costSummary
           );
           broadcastEvent({ type: 'node_complete', node: 'telegram', message: '발주서 발송 완료 보고', progress: 100, flow: ['brain->telegram'] });
         } catch (e) {
