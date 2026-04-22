@@ -1,5 +1,5 @@
 import express from 'express';
-import { generateSettlementXlsx, generateDispatchXlsx, calcCostSummary, type OrderItem } from './settlement';
+import { generateSettlementXlsx, generateBamDispatchXlsx, generateCornDispatchXlsx, calcCostSummary, isCornProduct, parseNaverOrderSheet, type OrderItem } from './settlement';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { bookingRouter } from './routes/booking';
@@ -204,67 +204,77 @@ app.post('/telegram-webhook', async (req, res) => {
             senderName: '이혜안',
             senderPhone: process.env.SENDER_PHONE || '',
           }));
-          const bamItems = orderItems.filter(o => {
-            const opt = o.productOption || o.productName;
-            return !(opt.includes('옥수수') || opt.includes('3X') || opt.includes('3x') || opt.includes('찰옥'));
-          });
-          const cornItems = orderItems.filter(o => {
-            const opt = o.productOption || o.productName;
-            return opt.includes('옥수수') || opt.includes('3X') || opt.includes('3x') || opt.includes('찰옥');
-          });
+          // 밤 / 옥수수 분류
+          const bamItems = orderItems.filter(o => !isCornProduct(o.productOption || o.productName));
+          const cornItems = orderItems.filter(o => isCornProduct(o.productOption || o.productName));
 
-          // 발주서 엑셀 생성
-          const dispatchXlsx = generateDispatchXlsx(dateStr, orderItems);
+          const { sendEmailNotification } = await import('./email');
+          const dispatchEmail = process.env.DISPATCH_EMAIL || 'jungsng805@naver.com';
+          let sentSummary = '';
 
-          // 정산서 엑셀 생성
-          const attachments: any[] = [
-            { filename: dateStr + '_발주서.xlsx', content: dispatchXlsx, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
-          ];
+          // ── 밤 발주서 (로젠택배) ──
           if (bamItems.length > 0) {
+            const bamDispatch = generateBamDispatchXlsx(dateStr, bamItems);
             const bamSettlement = generateSettlementXlsx(dateStr, bamItems, 'bam');
-            attachments.push({ filename: dateStr + '_밤정산서.xlsx', content: bamSettlement.xlsxBuffer, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const bamAttachments = [
+              { filename: dateStr + '_밤발주서(로젠).xls', content: bamDispatch, contentType: 'application/vnd.ms-excel' },
+              { filename: dateStr + '_밤정산서.xlsx', content: bamSettlement.xlsxBuffer, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+            ];
+            let bamHtml = '<h2>🌰 ' + dateStr + ' 밤 발주서 (로젠택배)</h2>';
+            bamHtml += '<table border="1" cellpadding="8" style="border-collapse:collapse;width:100%">';
+            bamHtml += '<tr style="background:#fff3cd"><th>제품</th><th>수량</th><th>받는분</th><th>핸드폰</th><th>주소</th></tr>';
+            for (const o of bamItems) {
+              bamHtml += `<tr><td>${o.productOption || o.productName}</td><td>${o.quantity}</td><td>${o.receiverName}</td><td>${o.receiverPhone}</td><td>${o.address}</td></tr>`;
+            }
+            bamHtml += `</table><p>총 ${bamItems.length}건 | 로젠택배 발주서 + 정산서 첨부</p>`;
+            broadcastEvent({ type: 'node_active', node: 'email', message: '밤 발주서(로젠) 이메일 발송 중...', progress: 60, flow: ['brain->email'] });
+            await sendEmailNotification({
+              to: dispatchEmail,
+              subject: `[자비스] ${dateStr} 밤 발주서(로젠택배) ${bamItems.length}건`,
+              html: bamHtml,
+              attachments: bamAttachments,
+            });
+            sentSummary += `🌰 밤(로젠): ${bamItems.length}건 발송 완료\n`;
           }
+
+          // ── 옥수수 발주서 (롯데택배) ──
           if (cornItems.length > 0) {
+            const cornDispatch = generateCornDispatchXlsx(dateStr, cornItems);
             const cornSettlement = generateSettlementXlsx(dateStr, cornItems, 'corn');
-            attachments.push({ filename: dateStr + '_옥수수정산서.xlsx', content: cornSettlement.xlsxBuffer, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const cornAttachments = [
+              { filename: dateStr + '_옥수수발주서(롯데).xlsx', content: cornDispatch, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+              { filename: dateStr + '_옥수수정산서.xlsx', content: cornSettlement.xlsxBuffer, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+            ];
+            let cornHtml = '<h2>🌽 ' + dateStr + ' 옥수수 발주서 (롯데택배)</h2>';
+            cornHtml += '<table border="1" cellpadding="8" style="border-collapse:collapse;width:100%">';
+            cornHtml += '<tr style="background:#d4edda"><th>상품주문번호</th><th>수취인</th><th>상품명</th><th>수량</th><th>연락처</th><th>주소</th></tr>';
+            for (const o of cornItems) {
+              cornHtml += `<tr><td>${o.orderId}</td><td>${o.receiverName}</td><td>${o.productOption || o.productName}</td><td>${o.quantity}</td><td>${o.receiverPhone}</td><td>${o.address}</td></tr>`;
+            }
+            cornHtml += `</table><p>총 ${cornItems.length}건 | 롯데택배 발주서 + 정산서 첨부</p>`;
+            broadcastEvent({ type: 'node_active', node: 'email', message: '옥수수 발주서(롯데) 이메일 발송 중...', progress: 75, flow: ['brain->email'] });
+            await sendEmailNotification({
+              to: dispatchEmail,
+              subject: `[자비스] ${dateStr} 옥수수 발주서(롯데택배) ${cornItems.length}건`,
+              html: cornHtml,
+              attachments: cornAttachments,
+            });
+            sentSummary += `🌽 옥수수(롯데): ${cornItems.length}건 발송 완료\n`;
           }
+
+          broadcastEvent({ type: 'node_complete', node: 'email', message: '발주서+정산서 이메일 발송 완료', progress: 85, flow: ['brain->email'] });
 
           // 원가 계산 요약
-          const costSummary = calcCostSummary(orderItems);
-
-          // 이메일 HTML 본문
-          let htmlBody = '<h2>📦 ' + dateStr + ' 발주서</h2>';
-          htmlBody += '<table border="1" cellpadding="8" style="border-collapse:collapse;width:100%">';
-          htmlBody += '<tr style="background:#f0f0f0"><th>옵션정보</th><th>수량</th><th>수취인</th><th>연락처</th><th>주소</th></tr>';
-          for (const order of orderItems) {
-            htmlBody += '<tr><td>' + (order.productOption || order.productName) + '</td>';
-            htmlBody += '<td>' + order.quantity + '</td>';
-            htmlBody += '<td>' + order.receiverName + '</td>';
-            htmlBody += '<td>' + order.receiverPhone + '</td>';
-            htmlBody += '<td>' + order.address + '</td></tr>';
-          }
-          htmlBody += '</table><p>총 ' + orders.length + '건 | 엑셀 파일 첨부됨</p>';
-
-          broadcastEvent({ type: 'node_active', node: 'email', message: '발주서+정산서 이메일 발송 중...', progress: 70, flow: ['brain->email'] });
-          const { sendEmailNotification } = await import('./email');
-          await sendEmailNotification({
-            to: process.env.DISPATCH_EMAIL || 'jungsng805@naver.com',
-            subject: '[자비스] ' + dateStr + ' 발주서+정산서 (' + orders.length + '건)',
-            html: htmlBody,
-            attachments,
-          });
-          broadcastEvent({ type: 'node_complete', node: 'email', message: '발주서+정산서 이메일 발송 완료', progress: 85, flow: ['brain->email'] });
+          const costSummary = calcCostSummary(bamItems, cornItems);
 
           broadcastEvent({ type: 'node_active', node: 'telegram', message: '발주서 완료 알림 발송 중...', progress: 90, flow: ['brain->telegram'] });
           await sendTelegram(
             '✅ <b>발주서+정산서 이메일 발송 완료</b>\n' +
             '━━━━━━━━━━━━━━━\n' +
             '📅 날짜: ' + dateStr + '\n' +
-            '📦 주문 수: <b>' + orders.length + '건</b>\n' +
-            (bamItems.length > 0 ? '🌰 밤: ' + bamItems.length + '건\n' : '') +
-            (cornItems.length > 0 ? '🌽 옥수수: ' + cornItems.length + '건\n' : '') +
-            '📎 첨부: 발주서.xlsx' + (bamItems.length > 0 ? ' + 밤정산서.xlsx' : '') + (cornItems.length > 0 ? ' + 옥수수정산서.xlsx' : '') + '\n' +
-            '📧 발송처: ' + (process.env.DISPATCH_EMAIL || 'jungsng805@naver.com') + '\n' +
+            '📦 총 주문: <b>' + orders.length + '건</b>\n' +
+            sentSummary +
+            '📧 발송처: ' + dispatchEmail + '\n' +
             '━━━━━━━━━━━━━━━' +
             costSummary
           );
@@ -318,6 +328,77 @@ app.post('/telegram-webhook', async (req, res) => {
         broadcastEvent({ type: 'node_complete', node: 'telegram', message: '정산 확인 완료 보고', progress: 100 });
       }
 
+      // ── 통합주문서 발주서+정산서 발송 확인 ──
+      else if (data.startsWith('send_order_sheet_')) {
+        const dateStr = data.replace('send_order_sheet_', '');
+        await answerCallbackQuery(query.id, '발주서+정산서 발송 중...');
+        broadcastEvent({ type: 'node_active', node: 'brain', message: '통합주문서 기반 발주서 발송 시작', progress: 10, flow: ['commander->brain'] });
+        const pending = (global as any).__pendingOrders;
+        if (!pending || pending.dateStr !== dateStr) {
+          await sendTelegram('⚠️ 주문 데이터가 만료되었습니다. 파일을 다시 업로드해 주세요.');
+        } else {
+          const { bamOrders, cornOrders } = pending;
+          try {
+            await sendTelegram('📤 발주서+정산서 이메일 발송 중...');
+            const { sendEmailNotification } = await import('./email');
+            const emailTo = process.env.DISPATCH_EMAIL || 'jungsng805@naver.com';
+
+            if (bamOrders.length > 0) {
+              const bamDispatch = generateBamDispatchXlsx(dateStr, bamOrders);
+              const bamSettlement = generateSettlementXlsx(dateStr, bamOrders, 'bam');
+              broadcastEvent({ type: 'node_active', node: 'email', message: '밤 발주서(로젠) 이메일 발송 중...', progress: 60, flow: ['brain->email'] });
+              await sendEmailNotification({
+                to: emailTo,
+                subject: `[셀렌] ${dateStr} 밤 발주서 (로젠택배)`,
+                html: `<p>${dateStr} 밤 발주서입니다.</p><p>총 ${bamOrders.length}건 / 로젠택배</p>`,
+                attachments: [
+                  { filename: dateStr + '_밤발주서(로젠).xls', content: bamDispatch, contentType: 'application/vnd.ms-excel' },
+                  { filename: dateStr + '_밤정산서.xlsx', content: bamSettlement.xlsxBuffer, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+                ],
+              });
+            }
+
+            if (cornOrders.length > 0) {
+              const cornDispatch = generateCornDispatchXlsx(dateStr, cornOrders);
+              const cornSettlement = generateSettlementXlsx(dateStr, cornOrders, 'corn');
+              broadcastEvent({ type: 'node_active', node: 'email', message: '옥수수 발주서(롯데) 이메일 발송 중...', progress: 75, flow: ['brain->email'] });
+              await sendEmailNotification({
+                to: emailTo,
+                subject: `[셀렌] ${dateStr} 옥수수 발주서 (롯데택배)`,
+                html: `<p>${dateStr} 옥수수 발주서입니다.</p><p>총 ${cornOrders.length}건 / 롯데택배</p>`,
+                attachments: [
+                  { filename: dateStr + '_옥수수발주서(롯데).xlsx', content: cornDispatch, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+                  { filename: dateStr + '_옥수수정산서.xlsx', content: cornSettlement.xlsxBuffer, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+                ],
+              });
+            }
+
+            broadcastEvent({ type: 'node_complete', node: 'email', message: '발주서+정산서 이메일 발송 완료', progress: 90 });
+            const costSummary = calcCostSummary(bamOrders, cornOrders);
+            await sendTelegram(
+              `✅ <b>발주서+정산서 이메일 발송 완료</b>\n` +
+              `━━━━━━━━━━━━━━━\n` +
+              `📅 날짜: ${dateStr}\n` +
+              `📦 총 주문: ${bamOrders.length + cornOrders.length}건\n` +
+              `🌰 밤(로젠): ${bamOrders.length}건\n` +
+              `🌽 옥수수(롯데): ${cornOrders.length}건\n` +
+              `📧 발송처: ${emailTo}\n` +
+              `━━━━━━━━━━━━━━━` +
+              costSummary
+            );
+            (global as any).__pendingOrders = null;
+          } catch (e) {
+            broadcastEvent({ type: 'node_error', node: 'email', message: '이메일 발송 오류: ' + String(e) });
+            await sendTelegram('❌ 이메일 발송 오류: ' + String(e));
+          }
+        }
+      }
+      // ── 통합주문서 취소 ──
+      else if (data === 'cancel_order_sheet') {
+        await answerCallbackQuery(query.id, '취소되었습니다');
+        (global as any).__pendingOrders = null;
+        await sendTelegram('❌ 발주서 발송이 취소되었습니다.');
+      }
       // ── 정산 재확인 ──
       else if (data.startsWith('recheck_settle_')) {
         const dateStr = data.replace('recheck_settle_', '');
@@ -356,6 +437,59 @@ app.post('/telegram-webhook', async (req, res) => {
     if (update.message) {
       const text = (update.message.text || '').trim();
       const chatId = update.message.chat?.id;
+
+      // ── 통합주문서 엑셀 파일 업로드 처리 ──
+      if (update.message.document) {
+        const doc = update.message.document;
+        const fname = (doc.file_name || '').toLowerCase();
+        const isExcel = fname.endsWith('.xlsx') || fname.endsWith('.xls');
+        if (isExcel) {
+          broadcastEvent({ type: 'node_active', node: 'brain', message: '통합주문서 파일 수신: ' + doc.file_name, progress: 10, flow: ['telegram->brain'] });
+          await sendTelegram('📂 통합주문서 파일을 받았습니다. 분석 중...');
+          try {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN || '';
+            // 파일 다운로드
+            const fileInfoRes = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${doc.file_id}`);
+            const fileInfo = await fileInfoRes.json() as any;
+            const filePath = fileInfo.result?.file_path;
+            if (!filePath) throw new Error('파일 경로를 가져올 수 없습니다');
+            const fileRes = await fetch(`https://api.telegram.org/file/bot${botToken}/${filePath}`);
+            const fileBuffer = Buffer.from(await fileRes.arrayBuffer());
+
+            // 파싱 및 분류
+            const parsed = parseNaverOrderSheet(fileBuffer, '1234');
+            const { bamOrders, cornOrders, unknownOrders, totalCount } = parsed;
+
+            broadcastEvent({ type: 'node_complete', node: 'smartstore', message: `통합주문서 분류 완료: 밤 ${bamOrders.length}건, 옥수수 ${cornOrders.length}건`, progress: 50 });
+
+            if (totalCount === 0) {
+              await sendTelegram('⚠️ 주문 데이터를 찾을 수 없습니다. 파일을 확인해주세요.');
+            } else {
+              const dateStr = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().split('T')[0];
+              let previewMsg = `📋 <b>통합주문서 분석 완료</b>\n━━━━━━━━━━━━━━━\n`;
+              previewMsg += `📦 총 ${totalCount}건\n`;
+              previewMsg += `🌰 밤(로젠): ${bamOrders.length}건\n`;
+              previewMsg += `🌽 옥수수(롯데): ${cornOrders.length}건\n`;
+              if (unknownOrders.length > 0) previewMsg += `❓ 미분류: ${unknownOrders.length}건\n`;
+              previewMsg += `━━━━━━━━━━━━━━━\n발주서+정산서를 이메일로 발송할까요?`;
+
+              await sendTelegram(previewMsg, {
+                inline_keyboard: [[
+                  { text: '✅ 발주서+정산서 발송', callback_data: 'send_order_sheet_' + dateStr },
+                  { text: '❌ 취소', callback_data: 'cancel_order_sheet' },
+                ]]
+              });
+
+              // 임시 저장 (전역 변수)
+              (global as any).__pendingOrders = { bamOrders, cornOrders, dateStr };
+            }
+          } catch (e) {
+            broadcastEvent({ type: 'node_error', node: 'brain', message: '통합주문서 처리 오류: ' + String(e) });
+            await sendTelegram('❌ 파일 처리 오류: ' + String(e));
+          }
+          return res.sendStatus(200);
+        }
+      }
       console.log('[Webhook] 메시지:', text, 'from chat_id:', chatId);
 
       // KST 날짜 헬퍼
