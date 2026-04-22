@@ -1,8 +1,9 @@
 import express from 'express';
-import { generateSettlementXlsx, generateBamDispatchXlsx, generateCornDispatchXlsx, calcCostSummary, isCornProduct, parseNaverOrderSheet, type OrderItem } from './settlement';
+import { generateSettlementXlsx, generateBamDispatchXlsx, generateCornDispatchXlsx, calcCostSummary, isCornProduct, parseNaverOrderSheet, getProductCostTable, BAM_PRODUCTS, CORN_PRODUCTS, type OrderItem } from './settlement';
 import { execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import FormData from 'form-data';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { bookingRouter } from './routes/booking';
@@ -17,6 +18,11 @@ import {
   getNewOrderDetails,
   getDailySettlement,
 } from './smartstore-scheduler';
+import {
+  writeSettlementToGoogleSheet,
+  writeDispatchToGoogleSheet,
+  isGoogleSheetsConfigured,
+} from './google-sheets';
 
 dotenv.config();
 const app = express();
@@ -68,6 +74,35 @@ function getNextRunTime(): string {
   if (nextRun <= now) nextRun.setUTCDate(nextRun.getUTCDate() + 1);
   const kst = new Date(nextRun.getTime() + 9 * 60 * 60 * 1000);
   return `${kst.getFullYear()}-${String(kst.getMonth()+1).padStart(2,'0')}-${String(kst.getDate()).padStart(2,'0')} 09:00 KST`;
+}
+
+// ─── 텔레그램 파일 전송 함수 ───
+async function sendTelegramDocument(fileBuffer: Buffer, filename: string, caption?: string): Promise<boolean> {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN || '';
+  const chatId = process.env.TELEGRAM_CHAT_ID || '';
+  if (!botToken || !chatId) return false;
+  try {
+    const form = new FormData();
+    form.append('chat_id', chatId);
+    form.append('document', fileBuffer, { filename, contentType: 'application/octet-stream' });
+    if (caption) form.append('caption', caption);
+    form.append('parse_mode', 'HTML');
+    const res = await fetch('https://api.telegram.org/bot' + botToken + '/sendDocument', {
+      method: 'POST',
+      body: form as any,
+      headers: form.getHeaders(),
+    });
+    const data = await res.json() as any;
+    if (!data.ok) {
+      console.error('[텔레그램] 파일 전송 실패:', data.description);
+      return false;
+    }
+    console.log('[텔레그램] 파일 전송 성공:', filename);
+    return true;
+  } catch (e) {
+    console.error('[텔레그램] 파일 전송 오류:', e);
+    return false;
+  }
 }
 
 // 헬스체크
@@ -510,7 +545,7 @@ app.post('/telegram-webhook', async (req, res) => {
       if (text === '/start' || text === '/help') {
         broadcastEvent({ type: 'log', node: 'telegram', message: '텔레그램 /help 명령 수신' });
         await sendTelegram(
-          '🤖 <b>자비스 (JARVIS) 명령어 목록</b>\n' +
+          '🤖 <b>자비스 (JARVIS) 전체 명령어</b>\n' +
           '━━━━━━━━━━━━━━━\n\n' +
           '📊 <b>주문/현황</b>\n' +
           '• /report - 어제+오늘 전체 현황 보고\n' +
@@ -522,10 +557,22 @@ app.post('/telegram-webhook', async (req, res) => {
           '📋 <b>발주서</b>\n' +
           '• /dispatch - 어제 발주서 발송 준비\n' +
           '• /dispatch YYYY-MM-DD - 특정 날짜 발주서\n\n' +
+          '📄 <b>문서 보기 (3채널)</b>\n' +
+          '• "정산서 보여줘" → 텔레그램 파일 전송\n' +
+          '• "정산서 구글시트로" → 구글 시트 링크\n' +
+          '• "정산서 깃헙" → GitHub 다운로드 링크\n' +
+          '• "발주서 보여줘" → 텔레그램 파일 전송\n' +
+          '• "발주서 구글시트로" → 구글 시트 링크\n' +
+          '• "발주서 깃헙" → GitHub 다운로드 링크\n\n' +
+          '💵 <b>원가 관리</b>\n' +
+          '• "원가 보여줘" → 전 상품 원가표\n' +
+          '• "원가 변경 밤 8000 9000" → 원가 수정\n\n' +
           '⚙️ <b>시스템</b>\n' +
           '• /status - 서버 및 시스템 상태 확인\n' +
           '• /help - 이 도움말 보기\n\n' +
           '━━━━━━━━━━━━━━━\n' +
+          '💡 자연어로 말씀하셔도 됩니다!\n' +
+          '예: "현황 알려줘", "오늘 주문 몇 개야?"\n' +
           '매일 09:00 KST 자동 보고 실행 중'
         );
 
@@ -772,7 +819,241 @@ app.post('/telegram-webhook', async (req, res) => {
             await sendTelegram('❌ 주문 목록 조회 실패\n' + String(e));
           }
 
-        // 정산
+        // ── 정산서 보기 (3채널: 텔레그램/구글시트/깃헙) ──
+        } else if (t.includes('정산서')) {
+          const channel = t.includes('구글') || t.includes('시트') ? 'google'
+            : t.includes('깃') || t.includes('git') || t.includes('github') ? 'github'
+            : 'telegram';
+          broadcastEvent({ type: 'node_active', node: 'brain', message: '정산서 요청 (' + channel + ')', progress: 10, flow: ['telegram->brain'] });
+          await sendTelegram('🔄 정산서를 준비하고 있습니다...');
+          try {
+            const token = await getSmartStoreToken();
+            if (!token) { await sendTelegram('❌ 스마트스토어 인증 실패'); return; }
+            const orders = await getNewOrderDetails(token, yesterdayKST, yesterdayKST);
+            if (orders.length === 0) {
+              await sendTelegram('📭 ' + yesterdayKST + ' 주문이 없어 정산서를 생성할 수 없습니다.');
+            } else {
+              const orderItems: OrderItem[] = orders.map((o: any) => ({
+                productName: o.productName || '', productOption: o.productOption || '',
+                quantity: o.quantity || 1, orderId: o.orderId || '',
+                receiverName: o.receiverName || '', receiverPhone: o.receiverPhone || '',
+                address: o.address || '', senderName: '셀렌', senderPhone: process.env.SENDER_PHONE || '',
+              }));
+              const bamItems = orderItems.filter(o => !isCornProduct(o.productOption || o.productName));
+              const cornItems = orderItems.filter(o => isCornProduct(o.productOption || o.productName));
+
+              if (channel === 'telegram') {
+                // 텔레그램으로 Excel 파일 직접 전송
+                if (bamItems.length > 0) {
+                  const bamResult = generateSettlementXlsx(yesterdayKST, bamItems, 'bam');
+                  await sendTelegramDocument(bamResult.xlsxBuffer, yesterdayKST + '_밤정산서.xlsx',
+                    '🌰 ' + yesterdayKST + ' 밤 정산서 (' + bamItems.length + '건)\n💰 정산금: ' + bamResult.totalCostWithShipping.toLocaleString('ko-KR') + '원');
+                }
+                if (cornItems.length > 0) {
+                  const cornResult = generateSettlementXlsx(yesterdayKST, cornItems, 'corn');
+                  await sendTelegramDocument(cornResult.xlsxBuffer, yesterdayKST + '_옥수수정산서.xlsx',
+                    '🌽 ' + yesterdayKST + ' 옥수수 정산서 (' + cornItems.length + '건)\n💰 정산금: ' + cornResult.totalCostWithShipping.toLocaleString('ko-KR') + '원');
+                }
+                await sendTelegram('✅ 정산서 파일 전송 완료!');
+              } else if (channel === 'google') {
+                // 구글 시트에 입력
+                if (!isGoogleSheetsConfigured()) {
+                  await sendTelegram('⚠️ 구글 시트 연동이 설정되지 않았습니다.\n환경변수 GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY를 설정해주세요.\n\n대신 텔레그램으로 파일을 보내드릴까요?', {
+                    inline_keyboard: [[
+                      { text: '📎 텔레그램으로 받기', callback_data: 'settlement_telegram_' + yesterdayKST },
+                    ]]
+                  });
+                } else {
+                  try {
+                    if (bamItems.length > 0) {
+                      const result = await writeSettlementToGoogleSheet(yesterdayKST, bamItems, 'bam');
+                      await sendTelegram('🌰 <b>밤 정산서 구글 시트</b>\n📎 ' + result.url);
+                    }
+                    if (cornItems.length > 0) {
+                      const result = await writeSettlementToGoogleSheet(yesterdayKST, cornItems, 'corn');
+                      await sendTelegram('🌽 <b>옥수수 정산서 구글 시트</b>\n📎 ' + result.url);
+                    }
+                    await sendTelegram('✅ 구글 시트에 정산서가 생성되었습니다!');
+                  } catch (e) {
+                    await sendTelegram('❌ 구글 시트 생성 실패: ' + String(e) + '\n\n텔레그램 파일로 대신 보내드리겠습니다.');
+                    if (bamItems.length > 0) {
+                      const bamResult = generateSettlementXlsx(yesterdayKST, bamItems, 'bam');
+                      await sendTelegramDocument(bamResult.xlsxBuffer, yesterdayKST + '_밤정산서.xlsx', '🌰 밤 정산서');
+                    }
+                    if (cornItems.length > 0) {
+                      const cornResult = generateSettlementXlsx(yesterdayKST, cornItems, 'corn');
+                      await sendTelegramDocument(cornResult.xlsxBuffer, yesterdayKST + '_옥수수정산서.xlsx', '🌽 옥수수 정산서');
+                    }
+                  }
+                }
+              } else if (channel === 'github') {
+                // GitHub에 저장 후 링크 전달
+                try {
+                  const dataDir = path.join(process.cwd(), 'data', yesterdayKST);
+                  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+                  if (bamItems.length > 0) {
+                    const bamResult = generateSettlementXlsx(yesterdayKST, bamItems, 'bam');
+                    fs.writeFileSync(path.join(dataDir, yesterdayKST + '_밤정산서.xlsx'), bamResult.xlsxBuffer);
+                  }
+                  if (cornItems.length > 0) {
+                    const cornResult = generateSettlementXlsx(yesterdayKST, cornItems, 'corn');
+                    fs.writeFileSync(path.join(dataDir, yesterdayKST + '_옥수수정산서.xlsx'), cornResult.xlsxBuffer);
+                  }
+                  execSync('cd ' + process.cwd() + ' && git add data/ && git commit -m "docs: ' + yesterdayKST + ' 정산서 저장" && git push origin main', { stdio: 'pipe' });
+                  const repoUrl = 'https://github.com/jsw72006869-prog/jarvis-booking-server/tree/main/data/' + yesterdayKST;
+                  await sendTelegram('✅ <b>정산서 GitHub 저장 완료</b>\n📎 ' + repoUrl);
+                } catch (e) {
+                  await sendTelegram('❌ GitHub 저장 실패: ' + String(e));
+                }
+              }
+            }
+          } catch (e) {
+            await sendTelegram('❌ 정산서 생성 실패\n' + String(e));
+          }
+
+        // ── 발주서 보기 (3채널) ──
+        } else if (t.includes('발주서')) {
+          const channel = t.includes('구글') || t.includes('시트') ? 'google'
+            : t.includes('깃') || t.includes('git') || t.includes('github') ? 'github'
+            : 'telegram';
+          broadcastEvent({ type: 'node_active', node: 'brain', message: '발주서 요청 (' + channel + ')', progress: 10, flow: ['telegram->brain'] });
+          await sendTelegram('🔄 발주서를 준비하고 있습니다...');
+          try {
+            const token = await getSmartStoreToken();
+            if (!token) { await sendTelegram('❌ 스마트스토어 인증 실패'); return; }
+            const orders = await getNewOrderDetails(token, yesterdayKST, yesterdayKST);
+            if (orders.length === 0) {
+              await sendTelegram('📭 ' + yesterdayKST + ' 주문이 없어 발주서를 생성할 수 없습니다.');
+            } else {
+              const orderItems: OrderItem[] = orders.map((o: any) => ({
+                productName: o.productName || '', productOption: o.productOption || '',
+                quantity: o.quantity || 1, orderId: o.orderId || '',
+                receiverName: o.receiverName || '', receiverPhone: o.receiverPhone || '',
+                address: o.address || '', senderName: '셀렌', senderPhone: process.env.SENDER_PHONE || '',
+              }));
+              const bamItems = orderItems.filter(o => !isCornProduct(o.productOption || o.productName));
+              const cornItems = orderItems.filter(o => isCornProduct(o.productOption || o.productName));
+
+              if (channel === 'telegram') {
+                if (bamItems.length > 0) {
+                  const bamDispatch = generateBamDispatchXlsx(yesterdayKST, bamItems);
+                  await sendTelegramDocument(bamDispatch, yesterdayKST + '_밤발주서(로젠).xls',
+                    '🌰 ' + yesterdayKST + ' 밤 발주서 - 로젠택배 (' + bamItems.length + '건)');
+                }
+                if (cornItems.length > 0) {
+                  const cornDispatch = generateCornDispatchXlsx(yesterdayKST, cornItems);
+                  await sendTelegramDocument(cornDispatch, yesterdayKST + '_옥수수발주서(롯데).xlsx',
+                    '🌽 ' + yesterdayKST + ' 옥수수 발주서 - 롯데택배 (' + cornItems.length + '건)');
+                }
+                await sendTelegram('✅ 발주서 파일 전송 완료!');
+              } else if (channel === 'google') {
+                if (!isGoogleSheetsConfigured()) {
+                  await sendTelegram('⚠️ 구글 시트 연동이 설정되지 않았습니다.\n대신 텔레그램으로 파일을 보내드릴까요?', {
+                    inline_keyboard: [[
+                      { text: '📎 텔레그램으로 받기', callback_data: 'dispatch_telegram_' + yesterdayKST },
+                    ]]
+                  });
+                } else {
+                  try {
+                    const result = await writeDispatchToGoogleSheet(yesterdayKST, bamItems, cornItems);
+                    await sendTelegram('✅ <b>발주서 구글 시트</b>\n📎 ' + result.url);
+                  } catch (e) {
+                    await sendTelegram('❌ 구글 시트 생성 실패: ' + String(e));
+                    if (bamItems.length > 0) {
+                      const bamDispatch = generateBamDispatchXlsx(yesterdayKST, bamItems);
+                      await sendTelegramDocument(bamDispatch, yesterdayKST + '_밤발주서(로젠).xls', '🌰 밤 발주서');
+                    }
+                    if (cornItems.length > 0) {
+                      const cornDispatch = generateCornDispatchXlsx(yesterdayKST, cornItems);
+                      await sendTelegramDocument(cornDispatch, yesterdayKST + '_옥수수발주서(롯데).xlsx', '🌽 옥수수 발주서');
+                    }
+                  }
+                }
+              } else if (channel === 'github') {
+                try {
+                  const dataDir = path.join(process.cwd(), 'data', yesterdayKST);
+                  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+                  if (bamItems.length > 0) {
+                    const bamDispatch = generateBamDispatchXlsx(yesterdayKST, bamItems);
+                    fs.writeFileSync(path.join(dataDir, yesterdayKST + '_밤발주서(로젠).xls'), bamDispatch);
+                  }
+                  if (cornItems.length > 0) {
+                    const cornDispatch = generateCornDispatchXlsx(yesterdayKST, cornItems);
+                    fs.writeFileSync(path.join(dataDir, yesterdayKST + '_옥수수발주서(롯데).xlsx'), cornDispatch);
+                  }
+                  execSync('cd ' + process.cwd() + ' && git add data/ && git commit -m "docs: ' + yesterdayKST + ' 발주서 저장" && git push origin main', { stdio: 'pipe' });
+                  const repoUrl = 'https://github.com/jsw72006869-prog/jarvis-booking-server/tree/main/data/' + yesterdayKST;
+                  await sendTelegram('✅ <b>발주서 GitHub 저장 완료</b>\n📎 ' + repoUrl);
+                } catch (e) {
+                  await sendTelegram('❌ GitHub 저장 실패: ' + String(e));
+                }
+              }
+            }
+          } catch (e) {
+            await sendTelegram('❌ 발주서 생성 실패\n' + String(e));
+          }
+
+        // ── 원가 보기 ──
+        } else if (t.includes('원가') && (t.includes('보여') || t.includes('알려') || t.includes('얼마') || t.includes('표'))) {
+          await sendTelegram(getProductCostTable());
+
+        // ── 원가 변경 ──
+        } else if (t.includes('원가') && (t.includes('변경') || t.includes('수정') || t.includes('바꿔') || t.includes('변경해'))) {
+          const isBam = t.includes('밤');
+          const isCornFlag = t.includes('옥수수') || t.includes('옥광');
+          if (!isBam && !isCornFlag) {
+            await sendTelegram('❓ 상품을 명시해 주세요.\n예: "원가 변경 밤 8000 9000"');
+          } else {
+            const numbers = text.match(/\d+/g);
+            if (!numbers || numbers.length < 2) {
+              await sendTelegram('❓ 원가 형식이 잘못되었습니다.\n예: "원가 변경 밤 8000 9000"');
+            } else {
+              const oldCost = parseInt(numbers[0]);
+              const newCost = parseInt(numbers[1]);
+              try {
+                const costFilePath = path.join(process.cwd(), 'data', 'product_cost.json');
+                let costData: any = {};
+                if (fs.existsSync(costFilePath)) {
+                  costData = JSON.parse(fs.readFileSync(costFilePath, 'utf-8'));
+                }
+                const category = isBam ? '밤' : '옥수수';
+                if (!costData[category]) costData[category] = [];
+                let updated = false;
+                for (const product of costData[category]) {
+                  if (product.cost === oldCost) {
+                    product.cost = newCost;
+                    updated = true;
+                  }
+                }
+                if (!updated) {
+                  await sendTelegram('❌ 원가 ' + oldCost.toLocaleString('ko-KR') + '원을 찾을 수 없습니다.\n현재 원가표를 확인하려면 "원가 보여줘"라고 말씀해주세요.');
+                } else {
+                  costData.last_updated = new Date().toISOString();
+                  costData.updated_by = 'TELEGRAM_USER';
+                  const dataDir = path.join(process.cwd(), 'data');
+                  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+                  fs.writeFileSync(costFilePath, JSON.stringify(costData, null, 2));
+                  try {
+                    execSync('cd ' + process.cwd() + ' && git add data/product_cost.json && git commit -m "docs: 원가 수정 - ' + category + ' ' + oldCost + '원 -> ' + newCost + '원" && git push origin main', { stdio: 'pipe' });
+                  } catch (gitErr) {
+                    console.error('[Git] 원가 변경 커밋 실패:', gitErr);
+                  }
+                  await sendTelegram(
+                    '✅ <b>' + category + ' 원가 변경 완료</b>\n' +
+                    '━━━━━━━━━━━━━━━\n' +
+                    '변경 전: ' + oldCost.toLocaleString('ko-KR') + '원\n' +
+                    '변경 후: ' + newCost.toLocaleString('ko-KR') + '원\n' +
+                    '━━━━━━━━━━━━━━━\n' +
+                    '📁 GitHub에 자동 저장되었습니다.'
+                  );
+                }
+              } catch (e) {
+                await sendTelegram('❌ 원가 변경 실패\n' + String(e));
+              }
+            }
+          }
+
+        // ── 정산 금액 조회 (기존) ──
         } else if (t.includes('정산') || t.includes('매출') || t.includes('수익') || t.includes('얼마 벌')) {
           broadcastEvent({ type: 'node_active', node: 'smartstore', message: '자연어 정산 요청', progress: 20, flow: ['telegram->brain', 'brain->smartstore'] });
           await sendTelegram('🔄 ' + yesterdayKST + ' 정산 내역을 조회하고 있습니다...');
@@ -796,16 +1077,20 @@ app.post('/telegram-webhook', async (req, res) => {
           }
 
         // 도움말
-        } else if (t.includes('도움') || t.includes('help') || t.includes('뭐') || t.includes('기능') || t.includes('명령')) {
+        } else if (t.includes('도움') || t.includes('help') || t.includes('기능') || t.includes('명령')) {
           await sendTelegram(
             '안녕하세요! 저는 자비스입니다 🤖\n\n' +
             '이렇게 말씀해 주세요:\n' +
             '• "현황 알려줘" → 전체 주문 현황\n' +
             '• "오늘 주문 몇 개야?" → 오늘 신규 주문\n' +
             '• "주문 목록 보여줘" → 처리 중 주문 목록\n' +
-            '• "정산 얼마야?" → 어제 정산 내역\n\n' +
+            '• "정산서 보여줘" → 텔레그램 파일 전송\n' +
+            '• "정산서 구글시트로" → 구글 시트 링크\n' +
+            '• "발주서 보여줘" → 텔레그램 파일 전송\n' +
+            '• "원가 보여줘" → 전 상품 원가표\n' +
+            '• "원가 변경 밤 8000 9000" → 원가 수정\n\n' +
             '또는 슬래시 명령어:\n' +
-            '/report /today /orders /settle /status'
+            '/report /today /orders /settle /dispatch /status'
           );
 
         // 인사
@@ -817,9 +1102,10 @@ app.post('/telegram-webhook', async (req, res) => {
           await sendTelegram(
             '죄송합니다, 잘 이해하지 못했습니다 😅\n\n' +
             '이렇게 말씀해 주세요:\n' +
-            '• "현황 알려줘"\n' +
-            '• "오늘 주문 몇 개야?"\n' +
-            '• "주문 목록 보여줘"\n\n' +
+            '• "현황 알려줘" / "오늘 주문 몇 개야?"\n' +
+            '• "정산서 보여줘" / "발주서 보여줘"\n' +
+            '• "정산서 구글시트로" / "발주서 깃헙"\n' +
+            '• "원가 보여줘" / "원가 변경 밤 8000 9000"\n\n' +
             '또는 /help 를 입력해 주세요.'
           );
         }
@@ -985,68 +1271,3 @@ async function autoSetupWebhook() {
   }
 }
 
-// ─── 원가 변경 명령어 처리 (index.ts 자연어 처리 부분에 추가할 코드) ───
-// 위치: 자연어 인식 섹션 (684줄 이후)에 다음 코드를 추가:
-/*
-        // 원가 변경
-        } else if (
-          t.includes('원가') && (t.includes('변경') || t.includes('수정') || t.includes('바꿔') || t.includes('변경해'))
-        ) {
-          const isBam = t.includes('밤');
-          const isCorn = t.includes('옥수수') || t.includes('옥광');
-          
-          if (!isBam && !isCorn) {
-            await sendTelegram('❓ 상품을 명시해 주세요.\n예: "밤 원가 8000 -> 9000으로 변경"');
-            return;
-          }
-
-          const numbers = text.match(/\d+/g);
-          if (!numbers || numbers.length < 2) {
-            await sendTelegram('❓ 원가 형식이 잘못되었습니다.\n예: "밤 원가 8000 -> 9000으로 변경"');
-            return;
-          }
-
-          const oldCost = parseInt(numbers[0]);
-          const newCost = parseInt(numbers[1]);
-
-          try {
-            const costFilePath = path.join(process.cwd(), 'data', 'product_cost.json');
-            const costData = JSON.parse(fs.readFileSync(costFilePath, 'utf-8'));
-            
-            let updated = false;
-            const category = isBam ? '밤' : '옥수수';
-            const products = costData[category] || [];
-
-            for (const product of products) {
-              if (product.cost === oldCost) {
-                product.cost = newCost;
-                updated = true;
-              }
-            }
-
-            if (!updated) {
-              await sendTelegram(`❌ 원가 ${oldCost}원을 찾을 수 없습니다.`);
-              return;
-            }
-
-            costData.last_updated = new Date().toISOString();
-            costData.updated_by = 'TELEGRAM_USER';
-            
-            fs.writeFileSync(costFilePath, JSON.stringify(costData, null, 2));
-            
-            execSync(`cd ${process.cwd()} && git add data/product_cost.json`, { stdio: 'pipe' });
-            execSync(`cd ${process.cwd()} && git commit -m "docs: 원가 수정 - ${category} ${oldCost}원 -> ${newCost}원"`, { stdio: 'pipe' });
-            execSync(`cd ${process.cwd()} && git push origin main`, { stdio: 'pipe' });
-
-            await sendTelegram(
-              `✅ <b>${category} 원가 변경 완료</b>\n` +
-              `━━━━━━━━━━━━━━━\n` +
-              `변경 전: ${oldCost.toLocaleString('ko-KR')}원\n` +
-              `변경 후: ${newCost.toLocaleString('ko-KR')}원\n` +
-              `━━━━━━━━━━━━━━━\n` +
-              `📁 GitHub에 자동 저장되었습니다.`
-            );
-          } catch (e) {
-            await sendTelegram(`❌ 원가 변경 실패\n${String(e)}`);
-          }
-*/

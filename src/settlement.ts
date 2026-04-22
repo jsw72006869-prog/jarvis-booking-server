@@ -1,4 +1,3 @@
-// settlement.ts - 정산서 + 발주서 자동 생성 모듈
 // 밤(로젠택배) / 옥수수(롯데택배) 양식 분리
 import * as XLSX from 'xlsx';
 
@@ -11,7 +10,7 @@ interface ProductCost {
 }
 
 // 밤 12종
-const BAM_PRODUCTS: ProductCost[] = [
+export const BAM_PRODUCTS: ProductCost[] = [
   { name: '공주알밤 대(1kg)',          cost: 8000,  price: 13800, shipping: 3000 },
   { name: '공주알밤 대(2kg)이상',       cost: 14000, price: 24800, shipping: 3000 },
   { name: '공주알밤 특(1kg)',          cost: 10000, price: 16800, shipping: 3000 },
@@ -27,11 +26,32 @@ const BAM_PRODUCTS: ProductCost[] = [
 ];
 
 // 옥수수 3종
-const CORN_PRODUCTS: ProductCost[] = [
+export const CORN_PRODUCTS: ProductCost[] = [
   { name: '냉동 대학찰옥수수 3x10 30개', cost: 30000, price: 52500, shipping: 3000 },
   { name: '냉동 대학찰옥수수 3x7 21개',  cost: 21000, price: 36500, shipping: 3000 },
   { name: '냉동 대학찰옥수수 3X5 15개',  cost: 15000, price: 28500, shipping: 3000 },
 ];
+
+// ─── 원가표 텍스트 생성 (텔레그램 표시용) ───
+export function getProductCostTable(): string {
+  let msg = '📊 <b>상품별 원가표</b>\n';
+  msg += '━━━━━━━━━━━━━━━\n\n';
+  msg += '🌰 <b>밤 상품 (12종)</b>\n';
+  for (const p of BAM_PRODUCTS) {
+    const margin = p.price - p.cost - p.shipping;
+    msg += `  • ${p.name}\n`;
+    msg += `    원가: ${p.cost.toLocaleString('ko-KR')}원 | 판매가: ${p.price.toLocaleString('ko-KR')}원 | 마진: ${margin.toLocaleString('ko-KR')}원\n`;
+  }
+  msg += '\n🌽 <b>옥수수 상품 (3종)</b>\n';
+  for (const p of CORN_PRODUCTS) {
+    const margin = p.price - p.cost - p.shipping;
+    msg += `  • ${p.name}\n`;
+    msg += `    원가: ${p.cost.toLocaleString('ko-KR')}원 | 판매가: ${p.price.toLocaleString('ko-KR')}원 | 마진: ${margin.toLocaleString('ko-KR')}원\n`;
+  }
+  msg += '\n━━━━━━━━━━━━━━━\n';
+  msg += '📦 배송비: 전 상품 3,000원';
+  return msg;
+}
 
 // 옵션명으로 상품 원가 찾기
 function findProductCost(optionName: string, isCorn: boolean): ProductCost | null {
