@@ -1,6 +1,7 @@
 // 실시간 주문 모니터 - 5분마다 스마트스토어 주문 상태 변화 감지
 // 새 주문 또는 상태 변경 시 텔레그램으로 즉시 알림
 // ★ Node.js 내장 fetch는 agent를 무시함 → axios 사용으로 프록시 확실 적용
+// ★ 2024-04-22 수정: 조건형 API(/v1/pay-order/seller/product-orders)로 변경
 
 import axios, { AxiosRequestConfig } from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -49,45 +50,86 @@ const STATUS_LABEL: Record<string, string> = {
   RETURNED: '↩️ 반품 완료',
 };
 
+/**
+ * 특정 날짜의 주문을 조건형 API로 조회합니다.
+ * API: GET /v1/pay-order/seller/product-orders
+ */
+async function fetchOrdersForDate(token: string, dateStr: string): Promise<OrderSnapshot[]> {
+  const orders: OrderSnapshot[] = [];
+  let page = 1;
+  let hasNext = true;
+
+  while (hasNext) {
+    try {
+      const fromDT = dateStr + 'T00:00:00.000%2B09:00';
+      const toDT = dateStr + 'T23:59:59.000%2B09:00';
+      const url =
+        'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders?' +
+        'from=' + fromDT + '&' +
+        'to=' + toDT + '&' +
+        'rangeType=PAYED_DATETIME&' +
+        'pageSize=300&' +
+        'page=' + page;
+
+      const data = await naverGet(url, { 'Authorization': 'Bearer ' + token });
+      const contents = data?.data?.contents || [];
+
+      for (const o of contents) {
+        const po = o.productOrder || o;
+        orders.push({
+          orderId: o.productOrderId || po.productOrderId || String(Math.random()),
+          status: o.productOrderStatus || po.productOrderStatus || 'UNKNOWN',
+          productName: po.productName || o.productName || '상품명 없음',
+          quantity: po.quantity || o.quantity || 1,
+          buyerName: po.buyerName || o.buyerName || po.receiverName || o.receiverName || '구매자',
+          orderAmount: po.totalPaymentAmount || o.totalPaymentAmount || 0,
+        });
+      }
+
+      hasNext = data?.data?.pagination?.hasNext === true;
+      page++;
+      if (page > 10) break;
+    } catch (e) {
+      console.error(`[주문모니터] ${dateStr} page=${page} 조회 오류:`, e);
+      hasNext = false;
+    }
+  }
+
+  return orders;
+}
+
 async function fetchRecentOrders(token: string): Promise<OrderSnapshot[]> {
   try {
     const kstOffset = 9 * 60 * 60 * 1000;
     const kstNow = new Date(Date.now() + kstOffset);
-    const thirtyDaysAgo = new Date(kstNow);
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const fromDate = thirtyDaysAgo.toISOString().split('T')[0];
-    const toDate = kstNow.toISOString().split('T')[0];
 
-    const statuses = [
-      'PAYED', 'DELIVERING_HOLD', 'DELIVERING', 'DELIVERED',
-      'PURCHASE_DECIDED', 'CANCEL_REQUEST', 'CANCELED',
-      'EXCHANGE_REQUEST', 'RETURN_REQUEST', 'RETURNED'
-    ];
+    // 모니터링은 최근 7일만 조회 (효율성)
+    const sevenDaysAgo = new Date(kstNow);
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const dates: string[] = [];
+    const current = new Date(sevenDaysAgo);
+    const end = new Date(kstNow);
+
+    while (current <= end) {
+      dates.push(current.toISOString().split('T')[0]);
+      current.setDate(current.getDate() + 1);
+    }
 
     const allOrders: OrderSnapshot[] = [];
 
-    for (const status of statuses) {
-      try {
-        // ★ axios + 프록시 경유
-        const data = await naverGet(
-          `https://api.commerce.naver.com/external/v1/pay-order/seller/orders/last-changed-statuses?` +
-          `lastChangedFrom=${fromDate}T00:00:00.000Z&lastChangedTo=${toDate}T23:59:59.000Z&` +
-          `orderStatuses=${status}&page=1&pageSize=100`,
-          { 'Authorization': 'Bearer ' + token }
-        );
-        const orders = data.data?.lastChangeStatuses || [];
-        for (const o of orders) {
-          allOrders.push({
-            orderId: o.orderId || o.productOrderId || String(Math.random()),
-            status,
-            productName: o.productName || o.productOption || '상품명 없음',
-            quantity: o.quantity || 1,
-            buyerName: o.buyerName || o.receiverName || '구매자',
-            orderAmount: o.totalPaymentAmount || o.productOrderAmount || 0,
-          });
-        }
-      } catch (e) {
-        // 개별 상태 조회 실패는 무시
+    // 4개씩 병렬 처리
+    const BATCH_SIZE = 4;
+    for (let i = 0; i < dates.length; i += BATCH_SIZE) {
+      const batch = dates.slice(i, i + BATCH_SIZE);
+      const results = await Promise.all(
+        batch.map(date => fetchOrdersForDate(token, date))
+      );
+      for (const orders of results) {
+        allOrders.push(...orders);
+      }
+      if (i + BATCH_SIZE < dates.length) {
+        await new Promise(r => setTimeout(r, 200));
       }
     }
 

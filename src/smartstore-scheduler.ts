@@ -3,6 +3,7 @@
 // 텔레그램으로 보고합니다.
 // 인증 방식: bcrypt (네이버 커머스API 공식 방식)
 // ★ 핵심: Node.js 내장 fetch는 agent를 무시함 → axios 사용으로 프록시 확실 적용
+// ★ 2024-04-22 수정: last-changed-statuses → /v1/pay-order/seller/product-orders (조건형 조회)
 
 import axios, { AxiosRequestConfig } from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -28,7 +29,7 @@ async function naverGet(url: string, headers: Record<string, string> = {}): Prom
   if (agent) {
     config.httpsAgent = agent;
     config.httpAgent = agent;
-    console.log('[프록시] Quotaguard GET →', url.substring(0, 80));
+    console.log('[프록시] Quotaguard GET →', url.substring(0, 100));
   }
   const res = await axios(config);
   return res.data;
@@ -43,7 +44,7 @@ async function naverPost(url: string, data?: any, headers: Record<string, string
   if (agent) {
     config.httpsAgent = agent;
     config.httpAgent = agent;
-    console.log('[프록시] Quotaguard POST →', url.substring(0, 80));
+    console.log('[프록시] Quotaguard POST →', url.substring(0, 100));
   }
   const res = await axios(config);
   return res.data;
@@ -144,70 +145,190 @@ function toKSTDateStr(date: Date): string {
   return date.toISOString().split('T')[0];
 }
 
-function splitDateRanges(fromDate: string, toDate: string, chunkDays: number): Array<{from: string, to: string}> {
-  const ranges: Array<{from: string, to: string}> = [];
-  let current = new Date(fromDate + 'T00:00:00.000Z');
-  const end = new Date(toDate + 'T23:59:59.000Z');
+/**
+ * 조건형 상품 주문 상세 내역 조회 API를 사용하여
+ * 특정 날짜(1일)의 모든 주문을 조회하고 상태별로 카운트합니다.
+ * 
+ * API: GET /v1/pay-order/seller/product-orders
+ * - rangeType: PAYED_DATETIME (결제일 기준)
+ * - from/to: 최대 24시간 차이 (1일 단위로 조회)
+ * - productOrderStatuses: 생략하여 모든 상태 반환
+ * - pageSize: 300 (최대)
+ * - 페이징: hasNext가 true면 다음 페이지 조회
+ */
+async function getOrdersForDate(
+  token: string,
+  dateStr: string
+): Promise<Record<string, number>> {
+  const statusCounts: Record<string, number> = {};
+  let page = 1;
+  let hasNext = true;
+
+  while (hasNext) {
+    try {
+      const fromDT = dateStr + 'T00:00:00.000%2B09:00';
+      const toDT = dateStr + 'T23:59:59.000%2B09:00';
+      const url =
+        'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders?' +
+        'from=' + fromDT + '&' +
+        'to=' + toDT + '&' +
+        'rangeType=PAYED_DATETIME&' +
+        'pageSize=300&' +
+        'page=' + page;
+
+      const data = await naverGet(url, { 'Authorization': 'Bearer ' + token });
+
+      const contents = data?.data?.contents || [];
+      const pagination = data?.data?.pagination;
+
+      for (const order of contents) {
+        const status = order.productOrderStatus || order.lastProductOrderStatus || 'UNKNOWN';
+        statusCounts[status] = (statusCounts[status] || 0) + 1;
+      }
+
+      hasNext = pagination?.hasNext === true;
+      page++;
+
+      // 안전장치: 최대 10페이지까지만 (3000건)
+      if (page > 10) {
+        console.warn(`[주문조회] ${dateStr} 페이지 초과 (10+), 중단`);
+        break;
+      }
+    } catch (e: any) {
+      const errMsg = e.response?.data?.message || e.message || String(e);
+      console.error(`[주문조회] ${dateStr} page=${page} 오류:`, errMsg);
+      hasNext = false;
+    }
+  }
+
+  return statusCounts;
+}
+
+/**
+ * 여러 날짜의 주문을 병렬로 조회하고 상태별로 합산합니다.
+ * API rate limit을 고려하여 동시 요청 수를 제한합니다.
+ */
+async function getAllOrderStatusCounts(
+  token: string,
+  fromDateStr: string,
+  toDateStr: string
+): Promise<Record<string, number>> {
+  const totalCounts: Record<string, number> = {};
+
+  // 날짜 목록 생성
+  const dates: string[] = [];
+  const current = new Date(fromDateStr + 'T00:00:00.000Z');
+  const end = new Date(toDateStr + 'T00:00:00.000Z');
 
   while (current <= end) {
-    const chunkEnd = new Date(current);
-    chunkEnd.setDate(chunkEnd.getDate() + chunkDays - 1);
-    if (chunkEnd > end) chunkEnd.setTime(end.getTime());
-
-    ranges.push({
-      from: current.toISOString().split('T')[0],
-      to: chunkEnd.toISOString().split('T')[0],
-    });
-
-    current = new Date(chunkEnd);
+    dates.push(current.toISOString().split('T')[0]);
     current.setDate(current.getDate() + 1);
   }
 
-  return ranges;
-}
+  console.log(`[주문조회] 총 ${dates.length}일 조회 시작 (${fromDateStr} ~ ${toDateStr})`);
 
-async function getOrderCountInRange(token: string, statuses: string[], fromDate: string, toDate: string): Promise<number> {
-  try {
-    const statusParam = statuses.map(s => 'orderStatuses=' + s).join('&');
-    const url =
-      'https://api.commerce.naver.com/external/v1/pay-order/seller/orders/last-changed-statuses?' +
-      'lastChangedFrom=' + fromDate + 'T00:00:00.000Z&' +
-      'lastChangedTo=' + toDate + 'T23:59:59.000Z&' +
-      statusParam + '&page=1&pageSize=1';
+  // 동시 요청 제한: 5개씩 병렬 처리
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < dates.length; i += BATCH_SIZE) {
+    const batch = dates.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map(date => getOrdersForDate(token, date))
+    );
 
-    // ★ axios + 프록시 경유
-    const data = await naverGet(url, { 'Authorization': 'Bearer ' + token });
-    return data.totalCount || 0;
-  } catch (e) {
-    console.error('[주문조회] 구간 오류:', e);
-    return 0;
-  }
-}
+    for (const result of results) {
+      for (const [status, count] of Object.entries(result)) {
+        totalCounts[status] = (totalCounts[status] || 0) + count;
+      }
+    }
 
-async function getOrderCountByStatus(token: string, statuses: string[], fromDate: string, toDate: string): Promise<number> {
-  const ranges = splitDateRanges(fromDate, toDate, 30);
-  let total = 0;
-
-  for (const range of ranges) {
-    const count = await getOrderCountInRange(token, statuses, range.from, range.to);
-    total += count;
-    console.log(`[주문조회] 상태:${statuses.join(',')} 구간:${range.from}~${range.to} → ${count}건`);
+    // 배치 간 짧은 딜레이 (rate limit 방지)
+    if (i + BATCH_SIZE < dates.length) {
+      await new Promise(r => setTimeout(r, 200));
+    }
   }
 
-  console.log(`[주문조회] 상태:${statuses.join(',')} 합계 → ${total}건`);
-  return total;
+  console.log('[주문조회] 전체 상태별 결과:', JSON.stringify(totalCounts));
+  return totalCounts;
 }
 
+/**
+ * 신규 주문(PAYED 상태)의 상세 정보를 조회합니다.
+ * 조건형 API를 사용하여 최근 30일간 PAYED 상태 주문을 조회합니다.
+ */
 export async function getNewOrderDetails(token: string, fromDate: string, toDate: string) {
-  try {
-    // ★ axios + 프록시 경유
-    const data = await naverGet(
-      'https://api.commerce.naver.com/external/v1/pay-order/seller/orders/last-changed-statuses?' +
-      'lastChangedFrom=' + fromDate + 'T00:00:00.000Z&lastChangedTo=' + toDate + 'T23:59:59.000Z&' +
-      'orderStatuses=PAYED&page=1&pageSize=100',
-      { 'Authorization': 'Bearer ' + token });
-    return data.data?.lastChangeStatuses || [];
-  } catch (e) { console.error('[신규주문 상세조회] 오류:', e); return []; }
+  const allOrders: any[] = [];
+
+  // 날짜 목록 생성
+  const dates: string[] = [];
+  const current = new Date(fromDate + 'T00:00:00.000Z');
+  const end = new Date(toDate + 'T00:00:00.000Z');
+
+  while (current <= end) {
+    dates.push(current.toISOString().split('T')[0]);
+    current.setDate(current.getDate() + 1);
+  }
+
+  // 5개씩 병렬 처리
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < dates.length; i += BATCH_SIZE) {
+    const batch = dates.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.all(
+      batch.map(async (dateStr) => {
+        const orders: any[] = [];
+        let page = 1;
+        let hasNext = true;
+
+        while (hasNext) {
+          try {
+            const fromDT = dateStr + 'T00:00:00.000%2B09:00';
+            const toDT = dateStr + 'T23:59:59.000%2B09:00';
+            const url =
+              'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders?' +
+              'from=' + fromDT + '&' +
+              'to=' + toDT + '&' +
+              'rangeType=PAYED_DATETIME&' +
+              'productOrderStatuses=PAYED&' +
+              'pageSize=300&' +
+              'page=' + page;
+
+            const data = await naverGet(url, { 'Authorization': 'Bearer ' + token });
+            const contents = data?.data?.contents || [];
+
+            for (const order of contents) {
+              orders.push({
+                productOrderId: order.productOrderId,
+                orderId: order.orderId,
+                productName: order.productOrder?.productName || order.productName || '',
+                productOption: order.productOrder?.productOption || order.productOption || '',
+                quantity: order.productOrder?.quantity || order.quantity || 1,
+                totalPaymentAmount: order.productOrder?.totalPaymentAmount || order.totalPaymentAmount || 0,
+                orderDate: order.productOrder?.paymentDate || order.paymentDate || '',
+              });
+            }
+
+            hasNext = data?.data?.pagination?.hasNext === true;
+            page++;
+            if (page > 10) break;
+          } catch (e) {
+            console.error(`[신규주문 상세] ${dateStr} page=${page} 오류:`, e);
+            hasNext = false;
+          }
+        }
+
+        return orders;
+      })
+    );
+
+    for (const orders of batchResults) {
+      allOrders.push(...orders);
+    }
+
+    if (i + BATCH_SIZE < dates.length) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+
+  return allOrders;
 }
 
 export async function getDailySettlement(token: string, settleDate: string) {
@@ -248,21 +369,28 @@ export async function runDailyOrderReport() {
     yesterday.setDate(yesterday.getDate() - 1);
     const yesterdayKST = toKSTDateStr(yesterday);
 
+    // 90일 전부터 오늘까지 조회
     const ninetyDaysAgo = new Date(kstNow);
     ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
     const ninetyDaysAgoKST = toKSTDateStr(ninetyDaysAgo);
 
     console.log(`[스케줄러] 조회 기간: ${ninetyDaysAgoKST} ~ ${todayKST}`);
 
-    const [newOrderCount, dispatchCount, deliveringCount, deliveredCount, confirmedCount, settlement] = await Promise.all([
-      getOrderCountByStatus(token, ['PAYED'], ninetyDaysAgoKST, todayKST),
-      getOrderCountByStatus(token, ['DELIVERING_HOLD'], ninetyDaysAgoKST, todayKST),
-      getOrderCountByStatus(token, ['DELIVERING'], ninetyDaysAgoKST, todayKST),
-      getOrderCountByStatus(token, ['DELIVERED'], ninetyDaysAgoKST, todayKST),
-      getOrderCountByStatus(token, ['PURCHASE_DECIDED'], ninetyDaysAgoKST, todayKST),
+    // ★ 핵심 변경: 조건형 API로 전체 주문 조회 후 상태별 카운트
+    const [statusCounts, settlement] = await Promise.all([
+      getAllOrderStatusCounts(token, ninetyDaysAgoKST, todayKST),
       getDailySettlement(token, yesterdayKST),
     ]);
 
+    const newOrderCount = statusCounts['PAYED'] || 0;
+    const dispatchCount = statusCounts['DELIVERING_HOLD'] || 0;
+    const deliveringCount = statusCounts['DELIVERING'] || 0;
+    const deliveredCount = statusCounts['DELIVERED'] || 0;
+    const confirmedCount = statusCounts['PURCHASE_DECIDED'] || 0;
+
+    console.log(`[스케줄러] 상태별 건수 - 신규:${newOrderCount} 배송준비:${dispatchCount} 배송중:${deliveringCount} 배송완료:${deliveredCount} 구매확정:${confirmedCount}`);
+
+    // 신규 주문 상세 조회 (최근 30일)
     const thirtyDaysAgo = new Date(kstNow);
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
     const thirtyDaysAgoKST = toKSTDateStr(thirtyDaysAgo);
