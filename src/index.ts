@@ -359,8 +359,10 @@ app.post('/telegram-webhook', async (req, res) => {
         try {
           const token = await getSmartStoreToken();
           if (!token) { await sendTelegram('❌ 스마트스토어 인증 실패'); return; }
-          // PAYED 상태 주문 조회
-          const newOrders = await getNewOrderDetails(token, dateStr);
+          // PAYED 상태 주문 조회 (해당 날짜 + 전날까지 범위로 조회)
+          const kstNow2 = new Date(Date.now() + 9 * 60 * 60 * 1000);
+          const todayKST2 = kstNow2.toISOString().split('T')[0];
+          const newOrders = await getNewOrderDetails(token, dateStr, todayKST2);
           if (!newOrders || newOrders.length === 0) {
             await sendTelegram('📭 발주확인할 신규 주문이 없습니다.');
             return;
