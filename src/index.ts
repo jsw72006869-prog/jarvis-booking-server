@@ -1186,7 +1186,7 @@ app.get('/setup-webhook', async (req, res) => {
     const result = await fetch('https://api.telegram.org/bot' + botToken + '/setWebhook', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: webhookUrl }),
+      body: JSON.stringify({ url: webhookUrl, allowed_updates: ['message', 'callback_query', 'channel_post', 'inline_query'] }),
     });
     const data = await result.json();
     console.log('[Webhook] 등록 결과:', data);
@@ -1309,7 +1309,7 @@ async function autoSetupWebhook() {
     const result = await fetch('https://api.telegram.org/bot' + botToken + '/setWebhook', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: webhookUrl }),
+      body: JSON.stringify({ url: webhookUrl, allowed_updates: ['message', 'callback_query', 'channel_post', 'inline_query'] }),
     });
     const data = await result.json() as any;
     if (data.ok) {
