@@ -493,46 +493,67 @@ export async function runDailyOrderReport() {
     yesterdayDate.setDate(yesterdayDate.getDate() - 1);
     const yesterdayKST = getKSTDateStr(yesterdayDate);
 
-    // 최근 30일 날짜 목록 생성
-    const dates: string[] = [];
+    // 날짜 범위 설정
+    // - PAYED/OK/DISPATCHED: 30일 (처리 대기 주문은 오래된 것도 포함)
+    // - DELIVERED/PURCHASE_DECIDED: 7일 (스마트스토어 홈과 동일한 기준)
+    const dates30: string[] = [];
     for (let i = 0; i <= 30; i++) {
       const d = new Date();
       d.setDate(d.getDate() - i);
-      dates.push(getKSTDateStr(d));
+      dates30.push(getKSTDateStr(d));
     }
-    const thirtyDaysAgoKST = dates[dates.length - 1];
+    const dates7: string[] = dates30.slice(0, 8); // 오늘 포함 최근 7일
+    const thirtyDaysAgoKST = dates30[dates30.length - 1];
 
-    console.log(`[스케줄러] 조회 범위: ${thirtyDaysAgoKST} ~ ${todayKST} (${dates.length}일)`);
+    console.log(`[스케줄러] 조회 범위: ${thirtyDaysAgoKST} ~ ${todayKST} (30일, DELIVERED/구매확정은 최근 7일)`);
 
     // ★★★ 핵심: 하루씩 반복 조회 후 현재 상태로 분류
-    // getOrdersForOneDay는 24시간 이내 조회로 API 제한 없음
-    // 조회된 주문의 productOrderStatus = 현재 상태 (결제일 기준 조회지만 현재 상태 반영)
-    const allOrders: any[] = [];
-    const seenIds = new Set<string>();
+    const allOrders30: any[] = [];
+    const seenIds30 = new Set<string>();
 
-    for (const dateStr of dates) {
+    for (const dateStr of dates30) {
       try {
         const dayOrders = await getOrdersForOneDay(token, dateStr);
         for (const order of dayOrders) {
-          if (order.productOrderId && !seenIds.has(order.productOrderId)) {
-            seenIds.add(order.productOrderId);
-            allOrders.push(order);
+          if (order.productOrderId && !seenIds30.has(order.productOrderId)) {
+            seenIds30.add(order.productOrderId);
+            allOrders30.push(order);
           }
         }
-        await new Promise(r => setTimeout(r, 300)); // API 속도 제한 준수
+        await new Promise(r => setTimeout(r, 300));
       } catch (e: any) {
         console.error(`[스케줄러] ${dateStr} 조회 오류:`, e.message);
       }
     }
 
-    console.log(`[스케줄러] 전체 주문 ${allOrders.length}건 조회 완료, 상태별 분류 중...`);
+    // 최근 7일 주문만 별도 추출 (배송완료/구매확정용)
+    const seenIds7 = new Set<string>();
+    const allOrders7: any[] = [];
+    for (const dateStr of dates7) {
+      for (const order of allOrders30) {
+        if (order.paymentDate && order.paymentDate.startsWith(dateStr) && !seenIds7.has(order.productOrderId)) {
+          seenIds7.add(order.productOrderId);
+          allOrders7.push(order);
+        }
+      }
+    }
+    // 7일 날짜 기준 조회가 정확하지 않을 수 있으므로 30일 중 7일치 날짜 조회 결과 사용
+    // 실제로는 30일 전체 조회 결과에서 PAYED/OK/DISPATCHED는 전체, DELIVERED/PURCHASE_DECIDED는 7일치만 카운트
+    const allOrders7ByDate = allOrders30.filter(o => {
+      const pd = (o.paymentDate || '').substring(0, 10);
+      return dates7.includes(pd);
+    });
+
+    console.log(`[스케줄러] 전체 주문 ${allOrders30.length}건 조회 완료, 상태별 분류 중...`);
 
     // 현재 상태별 분류
-    const payedOrders = allOrders.filter(o => o.productOrderStatus === 'PAYED');
-    const okOrders = allOrders.filter(o => o.productOrderStatus === 'OK');
-    const dispatchedOrders = allOrders.filter(o => o.productOrderStatus === 'DISPATCHED' || o.productOrderStatus === 'DELIVERING');
-    const deliveredOrders = allOrders.filter(o => o.productOrderStatus === 'DELIVERED');
-    const confirmedOrders = allOrders.filter(o => o.productOrderStatus === 'PURCHASE_DECIDED');
+    // PAYED/OK/DISPATCHED: 30일 전체 (처리 대기 주문)
+    // DELIVERED/PURCHASE_DECIDED: 최근 7일 (스마트스토어 홈 기준)
+    const payedOrders = allOrders30.filter(o => o.productOrderStatus === 'PAYED');
+    const okOrders = allOrders30.filter(o => o.productOrderStatus === 'OK');
+    const dispatchedOrders = allOrders30.filter(o => o.productOrderStatus === 'DISPATCHED' || o.productOrderStatus === 'DELIVERING');
+    const deliveredOrders = allOrders7ByDate.filter(o => o.productOrderStatus === 'DELIVERED');
+    const confirmedOrders = allOrders7ByDate.filter(o => o.productOrderStatus === 'PURCHASE_DECIDED');
 
     const newOrderCount = payedOrders.length;
     const dispatchCount = okOrders.length;
