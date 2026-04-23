@@ -479,7 +479,7 @@ export async function getDailySettlement(token: string, settleDate: string) {
  * 이유: 결제 날짜가 오래된 주문도 현재 상태가 해당 상태면 조회됨
  */
 export async function runDailyOrderReport() {
-  console.log('[스케줄러] 주문 보고 시작 (상태별 직접 조회 방식)...');
+  console.log('[스케줄러] 주문 보고 시작 (날짜별 반복 조회 방식)...');
   console.log('[스케줄러] 프록시:', process.env.QUOTAGUARDSTATIC_URL ? '✅ Quotaguard 활성' : '⚠️ 프록시 미설정');
   try {
     const token = await getSmartStoreToken();
@@ -493,34 +493,46 @@ export async function runDailyOrderReport() {
     yesterdayDate.setDate(yesterdayDate.getDate() - 1);
     const yesterdayKST = getKSTDateStr(yesterdayDate);
 
-    // 30일 전 날짜 (PAYED_DATETIME 기준 범위)
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const thirtyDaysAgoKST = getKSTDateStr(thirtyDaysAgo);
+    // 최근 30일 날짜 목록 생성
+    const dates: string[] = [];
+    for (let i = 0; i <= 30; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      dates.push(getKSTDateStr(d));
+    }
+    const thirtyDaysAgoKST = dates[dates.length - 1];
 
-    console.log(`[스케줄러] 조회 범위: ${thirtyDaysAgoKST} ~ ${todayKST}`);
+    console.log(`[스케줄러] 조회 범위: ${thirtyDaysAgoKST} ~ ${todayKST} (${dates.length}일)`);
 
-    // ★★★ 핵심: 상태별로 직접 조회 (4번 API 호출)
-    // 각 상태를 따로 조회하면 날짜/상태 분류 오류 없음
-    console.log('[스케줄러] PAYED(신규) 주문 조회...');
-    const payedOrders = await getOrdersByStatus(token, thirtyDaysAgoKST, todayKST, 'PAYED');
-    await new Promise(r => setTimeout(r, 1000));
+    // ★★★ 핵심: 하루씩 반복 조회 후 현재 상태로 분류
+    // getOrdersForOneDay는 24시간 이내 조회로 API 제한 없음
+    // 조회된 주문의 productOrderStatus = 현재 상태 (결제일 기준 조회지만 현재 상태 반영)
+    const allOrders: any[] = [];
+    const seenIds = new Set<string>();
 
-    console.log('[스케줄러] OK(배송준비) 주문 조회...');
-    const okOrders = await getOrdersByStatus(token, thirtyDaysAgoKST, todayKST, 'OK');
-    await new Promise(r => setTimeout(r, 1000));
+    for (const dateStr of dates) {
+      try {
+        const dayOrders = await getOrdersForOneDay(token, dateStr);
+        for (const order of dayOrders) {
+          if (order.productOrderId && !seenIds.has(order.productOrderId)) {
+            seenIds.add(order.productOrderId);
+            allOrders.push(order);
+          }
+        }
+        await new Promise(r => setTimeout(r, 300)); // API 속도 제한 준수
+      } catch (e: any) {
+        console.error(`[스케줄러] ${dateStr} 조회 오류:`, e.message);
+      }
+    }
 
-    console.log('[스케줄러] DISPATCHED(배송중) 주문 조회...');
-    const dispatchedOrders = await getOrdersByStatus(token, thirtyDaysAgoKST, todayKST, 'DISPATCHED');
-    await new Promise(r => setTimeout(r, 1000));
+    console.log(`[스케줄러] 전체 주문 ${allOrders.length}건 조회 완료, 상태별 분류 중...`);
 
-    console.log('[스케줄러] DELIVERED(배송완료) 주문 조회...');
-    const deliveredOrders = await getOrdersByStatus(token, thirtyDaysAgoKST, todayKST, 'DELIVERED');
-    await new Promise(r => setTimeout(r, 1000));
-
-    console.log('[스케줄러] PURCHASE_DECIDED(구매확정) 주문 조회...');
-    const confirmedOrders = await getOrdersByStatus(token, thirtyDaysAgoKST, todayKST, 'PURCHASE_DECIDED');
-    await new Promise(r => setTimeout(r, 1000));
+    // 현재 상태별 분류
+    const payedOrders = allOrders.filter(o => o.productOrderStatus === 'PAYED');
+    const okOrders = allOrders.filter(o => o.productOrderStatus === 'OK');
+    const dispatchedOrders = allOrders.filter(o => o.productOrderStatus === 'DISPATCHED' || o.productOrderStatus === 'DELIVERING');
+    const deliveredOrders = allOrders.filter(o => o.productOrderStatus === 'DELIVERED');
+    const confirmedOrders = allOrders.filter(o => o.productOrderStatus === 'PURCHASE_DECIDED');
 
     const newOrderCount = payedOrders.length;
     const dispatchCount = okOrders.length;
