@@ -483,3 +483,95 @@ export async function runDailyOrderReport() {
     await sendTelegram('❌ [자동 보고] 오류 발생\n' + errMsg);
   }
 }
+
+
+/**
+ * 주문 배송 상태 업데이트 (배송 준비 → 배송 중)
+ * @param token 스마트스토어 API 토큰
+ * @param productOrderIds 상품주문ID 배열
+ * @param shippingCompany 택배사 (로젠, 롯데, CJ, 한진, 우체국 등)
+ * @param trackingNumber 송장번호
+ */
+export async function updateOrderShippingStatus(
+  token: string,
+  productOrderIds: string[],
+  shippingCompany: string,
+  trackingNumber: string
+): Promise<{ success: boolean; message: string }> {
+  try {
+    if (!productOrderIds || productOrderIds.length === 0) {
+      return { success: false, message: '상품주문ID가 없습니다.' };
+    }
+
+    console.log(`[배송] 상태 업데이트 시작: ${productOrderIds.length}건, 택배사=${shippingCompany}, 송장=${trackingNumber}`);
+
+    const url = 'https://api.commerce.naver.com/external/v1/product-orders/shipping-info';
+    const headers = {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    };
+
+    // 스마트스토어 API: 배송정보 등록
+    // 참고: https://developer.naver.com/docs/commerce/api-reference/product-order-api#배송정보-등록
+    const payload = {
+      productOrderId: productOrderIds[0], // API는 1건씩 처리 필요
+      shippingCompanyCode: shippingCompany,
+      trackingNumber: trackingNumber,
+    };
+
+    const response = await naverPost(url, payload, headers);
+    
+    if (response.code === 'Success' || response.code === '00000000') {
+      console.log(`[배송] 상태 업데이트 성공: ${productOrderIds[0]}`);
+      return { success: true, message: `배송 상태 업데이트 완료 (송장: ${trackingNumber})` };
+    } else {
+      console.error(`[배송] API 오류:`, response.message || response.code);
+      return { success: false, message: `배송 상태 업데이트 실패: ${response.message || response.code}` };
+    }
+  } catch (error: any) {
+    const errMsg = error.response?.data?.message || error.message || String(error);
+    console.error('[배송] 오류:', errMsg);
+    return { success: false, message: `배송 상태 업데이트 오류: ${errMsg}` };
+  }
+}
+
+/**
+ * 배송 준비 중인 주문 조회
+ * @param token 스마트스토어 API 토큰
+ * @param fromDate 시작 날짜 (YYYY-MM-DD)
+ * @param toDate 종료 날짜 (YYYY-MM-DD)
+ */
+export async function getDispatchReadyOrders(
+  token: string,
+  fromDate: string,
+  toDate: string
+): Promise<any[]> {
+  try {
+    const orders: any[] = [];
+    const headers = { 'Authorization': `Bearer ${token}` };
+
+    // 최근 14일 순차 조회
+    const startDate = new Date(fromDate);
+    const endDate = new Date(toDate);
+    
+    for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+      const dateStr = d.toISOString().split('T')[0];
+      const url = `https://api.commerce.naver.com/external/v1/product-orders?searchType=orderDate&startDate=${dateStr}&endDate=${dateStr}&pageSize=100`;
+      
+      const response = await naverGet(url, headers);
+      if (response.code === 'Success' && response.data?.productOrders) {
+        const dispatchReady = response.data.productOrders.filter((o: any) => o.productOrderStatus === 'OK');
+        orders.push(...dispatchReady);
+      }
+      
+      // API 레이트 제한 준수 (초당 2회)
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    console.log(`[배송] 배송 준비 중인 주문 ${orders.length}건 조회 완료`);
+    return orders;
+  } catch (error: any) {
+    console.error('[배송] 조회 오류:', error.message);
+    return [];
+  }
+}

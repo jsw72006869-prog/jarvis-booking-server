@@ -17,6 +17,8 @@ import {
   getSmartStoreToken,
   getNewOrderDetails,
   getDailySettlement,
+  updateOrderShippingStatus,
+  getDispatchReadyOrders,
 } from './smartstore-scheduler';
 import {
   writeSettlementToGoogleSheet,
@@ -343,6 +345,50 @@ app.post('/telegram-webhook', async (req, res) => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ chat_id: chatId, message_id: messageId, text: originalText + '\n\n⏭ 발주서 발송을 건너뛰었습니다.', parse_mode: 'HTML' }),
           });
+        }
+      }
+
+      // ── 배송 처리 ──
+      else if (data.startsWith('confirm_shipping_')) {
+        const dateStr = data.replace('confirm_shipping_', '');
+        await answerCallbackQuery(query.id, '배송 처리 중...');
+        broadcastEvent({ type: 'node_active', node: 'brain', message: '배송 처리 시작: ' + dateStr, progress: 10, flow: ['commander->brain'] });
+        await sendTelegram('⏳ 배송 상태를 업데이트하고 있습니다...');
+        try {
+          const token = await getSmartStoreToken();
+          if (!token) {
+            await sendTelegram('❌ 스마트스토어 인증 실패. 배송 처리를 중단합니다.');
+            return;
+          }
+          const orders = await getDispatchReadyOrders(token, dateStr, dateStr);
+          if (orders.length === 0) {
+            await sendTelegram('📭 배송 준비 중인 주문이 없습니다.');
+            return;
+          }
+          let successCount = 0;
+          let failCount = 0;
+          for (const order of orders) {
+            const result = await updateOrderShippingStatus(
+              token,
+              [order.productOrderId],
+              '로젠',
+              'PENDING'
+            );
+            if (result.success) successCount++;
+            else failCount++;
+          }
+          broadcastEvent({ type: 'node_complete', node: 'smartstore', message: `배송 처리 완료: ${successCount}건 성공, ${failCount}건 실패`, progress: 100 });
+          await sendTelegram(
+            '✅ <b>배송 처리 완료</b>\n' +
+            '━━━━━━━━━━━━━━━\n' +
+            '📅 날짜: ' + dateStr + '\n' +
+            '✅ 성공: <b>' + successCount + '건</b>\n' +
+            (failCount > 0 ? '❌ 실패: <b>' + failCount + '건</b>\n' : '') +
+            '━━━━━━━━━━━━━━━'
+          );
+        } catch (e) {
+          broadcastEvent({ type: 'node_error', node: 'brain', message: '배송 처리 오류: ' + String(e) });
+          await sendTelegram('❌ 배송 처리 중 오류 발생\n' + String(e));
         }
       }
 
