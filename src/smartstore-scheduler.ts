@@ -228,29 +228,50 @@ async function getOrdersForOneDay(
         contents = data.data;
       }
 
+      // ★ 첫 번째 아이템 구조 로그 (디버깅용)
+      if (page === 1 && contents.length > 0) {
+        const sample = contents[0];
+        console.log(`[주문조회] ${dateStr} 응답 샘플 키:`, Object.keys(sample).join(', '));
+        if (sample.content) console.log(`[주문조회] content 키:`, Object.keys(sample.content).join(', '));
+        if (sample.content?.productOrder) console.log(`[주문조회] content.productOrder.status:`, sample.content.productOrder.productOrderStatus);
+        if (sample.productOrder) console.log(`[주문조회] productOrder.status:`, sample.productOrder.productOrderStatus);
+        if (sample.productOrderStatus) console.log(`[주문조회] item.productOrderStatus:`, sample.productOrderStatus);
+      }
+
       for (const item of contents) {
-        // ★ 실제 API 응답 구조 (2026-04-22 로그에서 확인):
-        // contents[i].content.productOrder.productOrderStatus = 현재 상태
+        // ★ 네이버 커머스 API 응답 구조 - 여러 경로 모두 시도:
+        // 경로1: item.content.productOrder.productOrderStatus (신규 API)
+        // 경로2: item.productOrder.productOrderStatus (구형 API)
+        // 경로3: item.productOrderStatus (단순 구조)
         const contentPO = item.content?.productOrder || {};
         const contentOrder = item.content?.order || {};
         const po = item.productOrder || {};
         
-        const status = contentPO.productOrderStatus
-          || item.productOrderStatus 
-          || po.productOrderStatus 
-          || 'UNKNOWN';
+        // 모든 경로에서 상태값 추출 (비어있지 않은 첫 번째 값 사용)
+        const status = (contentPO.productOrderStatus && contentPO.productOrderStatus !== '')
+          ? contentPO.productOrderStatus
+          : (po.productOrderStatus && po.productOrderStatus !== '')
+          ? po.productOrderStatus
+          : (item.productOrderStatus && item.productOrderStatus !== '')
+          ? item.productOrderStatus
+          : 'UNKNOWN';
+
+        const productOrderId = item.productOrderId 
+          || contentPO.productOrderId 
+          || po.productOrderId 
+          || '';
 
         orders.push({
-          productOrderId: item.productOrderId || contentPO.productOrderId || po.productOrderId || '',
+          productOrderId,
           orderId: contentOrder.orderId || item.orderId || po.orderId || '',
           productOrderStatus: status,
-          productName: contentPO.productName || item.productName || po.productName || '',
-          productOption: contentPO.productOption || item.productOption || po.productOption || '',
-          quantity: contentPO.quantity || item.quantity || po.quantity || 1,
-          totalPaymentAmount: contentPO.totalPaymentAmount || item.totalPaymentAmount || po.totalPaymentAmount || 0,
-          buyerName: contentOrder.buyerName || item.buyerName || po.buyerName || '',
-          receiverName: contentPO.shippingAddress?.name || item.receiverName || po.receiverName || '',
-          paymentDate: contentPO.paymentDate || contentOrder.orderDate || item.paymentDate || po.paymentDate || '',
+          productName: contentPO.productName || po.productName || item.productName || '',
+          productOption: contentPO.productOption || po.productOption || item.productOption || '',
+          quantity: contentPO.quantity || po.quantity || item.quantity || 1,
+          totalPaymentAmount: contentPO.totalPaymentAmount || po.totalPaymentAmount || item.totalPaymentAmount || 0,
+          buyerName: contentOrder.buyerName || po.buyerName || item.buyerName || '',
+          receiverName: contentPO.shippingAddress?.name || po.receiverName || item.receiverName || '',
+          paymentDate: contentPO.paymentDate || contentOrder.orderDate || po.paymentDate || item.paymentDate || '',
         });
       }
 
@@ -392,11 +413,13 @@ export async function runDailyOrderReport() {
     const settlement = await getDailySettlement(token, yesterdayKST);
 
     // ★ 활성 주문만 필터링 (취소/반품 제외)
+    // ★ 취소/반품 상태만 제외 (활성 주문 상태는 모두 포함)
+    // PAYED=신규, OK=배송준비, DISPATCHED/DELIVERING=배송중, DELIVERED=배송완료, PURCHASE_DECIDED=구매확정
     const excludeStatuses = new Set([
       'CANCELED', 'CANCEL_REQUESTED', 'CANCEL_DONE',
       'RETURNED', 'RETURN_REQUESTED', 'RETURN_DONE',
       'EXCHANGED', 'EXCHANGE_REQUESTED',
-      'COLLECT_DONE', 'UNKNOWN',
+      'COLLECT_DONE',
     ]);
 
     const activeOrders = allOrders.filter(o => !excludeStatuses.has(o.productOrderStatus));
@@ -409,13 +432,14 @@ export async function runDailyOrderReport() {
     }
 
     const newOrderCount = statusCounts['PAYED'] || 0;
+    // OK = 배송준비, DISPATCHED = 배송중 (스마트스토어 판매자센터와 동일한 분류)
     const dispatchCount = (statusCounts['OK'] || 0) + (statusCounts['DELIVERING_HOLD'] || 0);
-    const deliveringCount = statusCounts['DELIVERING'] || 0;
+    const deliveringCount = (statusCounts['DELIVERING'] || 0) + (statusCounts['DISPATCHED'] || 0);
     const deliveredCount = statusCounts['DELIVERED'] || 0;
     const confirmedCount = statusCounts['PURCHASE_DECIDED'] || 0;
 
     console.log(`[스케줄러] 전체 조회 결과: ${allOrders.length}건 (활성: ${activeOrders.length}건)`);
-    console.log(`[스케줄러] 상태별 - 신규:${newOrderCount} 배송준비:${dispatchCount} 배송중:${deliveringCount} 배송완료:${deliveredCount} 구매확정:${confirmedCount}`);
+    console.log(`[스케줄러] 상태별 - 신규(PAYED):${newOrderCount} 배송준비(OK):${dispatchCount} 배송중(DELIVERING/DISPATCHED):${deliveringCount} 배송완료:${deliveredCount} 구매확정:${confirmedCount}`);
     console.log(`[스케줄러] 전체 상태 분포:`, JSON.stringify(statusCounts));
 
     // 신규 주문(PAYED) 상세
@@ -425,7 +449,7 @@ export async function runDailyOrderReport() {
     message += '━━━━━━━━━━━━━━━\n';
     message += '🆕 신규 주문: <b>' + newOrderCount + '건</b>\n';
     message += '📦 배송 준비: <b>' + dispatchCount + '건</b>\n';
-    message += '🚚 배송 중: <b>' + deliveringCount + '건</b>\n';
+    message += '🚚 배송 중: <b>' + deliveringCount + '건</b>\n'; // DELIVERING + DISPATCHED
     message += '📬 배송 완료: <b>' + deliveredCount + '건</b>\n';
     message += '✅ 구매 확정: <b>' + confirmedCount + '건</b>\n';
     message += '━━━━━━━━━━━━━━━\n';
@@ -672,6 +696,40 @@ async function getOrdersForDateRange(token: string, fromDate: string, toDate: st
     await new Promise(r => setTimeout(r, 500));
   }
   return allOrders;
+}
+
+/**
+ * 최근 N일 범위의 PAYED(신규) 주문을 모두 조회합니다.
+ * 발주확인 처리 시 날짜 범위를 넓게 조회하기 위해 사용합니다.
+ */
+export async function getNewOrderDetailsRange(token: string, fromDate: string, toDate: string) {
+  const allOrders: any[] = [];
+  // fromDate ~ toDate 사이의 모든 날짜 생성
+  const from = new Date(fromDate);
+  const to = new Date(toDate);
+  const dates: string[] = [];
+  for (let d = new Date(from); d <= to; d.setDate(d.getDate() + 1)) {
+    dates.push(d.toISOString().split('T')[0]);
+  }
+  console.log(`[발주확인조회] ${fromDate} ~ ${toDate} (${dates.length}일) PAYED 주문 조회`);
+  for (const dateStr of dates) {
+    const orders = await getOrdersForOneDay(token, dateStr, 'PAYED');
+    if (orders.length > 0) {
+      console.log(`[발주확인조회] ${dateStr}: ${orders.length}건`);
+      allOrders.push(...orders);
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  // 중복 제거 (productOrderId 기준)
+  const seen = new Set<string>();
+  const unique = allOrders.filter(o => {
+    const id = o.productOrderId;
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+  console.log(`[발주확인조회] 총 ${unique.length}건 PAYED 주문 발견`);
+  return unique;
 }
 
 /**
