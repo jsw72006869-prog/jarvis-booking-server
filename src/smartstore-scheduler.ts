@@ -316,15 +316,16 @@ async function getOrdersByStatus(
 
   while (hasNext) {
     try {
-      // 시작/종료 날짜를 ISO8601 형식으로 변환 (KST 기준)
-      const startISO = `${fromDate}T00:00:00+09:00`;
-      const endISO = `${toDate}T23:59:59+09:00`;
-      const url = `https://api.commerce.naver.com/external/v1/product-orders` +
-        `?rangeType=PAYED_DATETIME` +
-        `&startDate=${encodeURIComponent(startISO)}` +
-        `&endDate=${encodeURIComponent(endISO)}` +
+      // 실제 작동하는 엔드포인트: /pay-order/seller/product-orders
+      // from/to 파라미터 사용 (getOrdersForOneDay와 동일한 방식)
+      const fromISO = encodeURIComponent(`${fromDate}T00:00:00.000+09:00`);
+      const toISO = encodeURIComponent(`${toDate}T23:59:59.000+09:00`);
+      const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders` +
+        `?from=${fromISO}` +
+        `&to=${toISO}` +
+        `&rangeType=PAYED_DATETIME` +
         `&productOrderStatuses=${status}` +
-        `&pageSize=100&page=${page}`;
+        `&pageSize=300&page=${page}`;
 
       const data = await naverGet(url, headers);
 
