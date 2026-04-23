@@ -464,8 +464,16 @@ export async function runDailyOrderReport() {
     const buttons: any[] = [];
     if (newOrderCount > 0) {
       buttons.push([
-        { text: '📋 발주서 발송하기', callback_data: 'confirm_dispatch_' + todayKST },
+        { text: '✅ 발주확인 처리', callback_data: 'confirm_order_' + todayKST },
+        { text: '📋 발주서 발송', callback_data: 'confirm_dispatch_' + todayKST },
+      ]);
+      buttons.push([
         { text: '⏭ 나중에', callback_data: 'skip_dispatch' },
+      ]);
+    }
+    if (dispatchCount > 0) {
+      buttons.push([
+        { text: '🚚 배송처리 (송장입력)', callback_data: 'start_shipping_' + todayKST },
       ]);
     }
     if (settlement && settlement.settleAmount > 0) {
@@ -486,60 +494,139 @@ export async function runDailyOrderReport() {
 
 
 /**
- * 주문 배송 상태 업데이트 (배송 준비 → 배송 중)
+ * 발주 확인 처리 (결제완료 PAYED → 배송준비 OK)
+ * 네이버 커머스 API: PUT /external/v1/product-orders/confirm
  * @param token 스마트스토어 API 토큰
- * @param productOrderIds 상품주문ID 배열
- * @param shippingCompany 택배사 (로젠, 롯데, CJ, 한진, 우체국 등)
- * @param trackingNumber 송장번호
+ * @param productOrderIds 상품주문ID 배열 (최대 30개)
  */
-export async function updateOrderShippingStatus(
+export async function confirmProductOrders(
   token: string,
-  productOrderIds: string[],
-  shippingCompany: string,
-  trackingNumber: string
-): Promise<{ success: boolean; message: string }> {
+  productOrderIds: string[]
+): Promise<{ success: boolean; message: string; successIds: string[]; failIds: string[] }> {
+  const successIds: string[] = [];
+  const failIds: string[] = [];
+
   try {
     if (!productOrderIds || productOrderIds.length === 0) {
-      return { success: false, message: '상품주문ID가 없습니다.' };
+      return { success: false, message: '상품주문ID가 없습니다.', successIds, failIds };
     }
 
-    console.log(`[배송] 상태 업데이트 시작: ${productOrderIds.length}건, 택배사=${shippingCompany}, 송장=${trackingNumber}`);
+    console.log(`[발주확인] 처리 시작: ${productOrderIds.length}건`);
 
-    const url = 'https://api.commerce.naver.com/external/v1/product-orders/shipping-info';
+    const url = 'https://api.commerce.naver.com/external/v1/product-orders/confirm';
     const headers = {
       'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
     };
 
-    // 스마트스토어 API: 배송정보 등록
-    // 참고: https://developer.naver.com/docs/commerce/api-reference/product-order-api#배송정보-등록
-    const payload = {
-      productOrderId: productOrderIds[0], // API는 1건씩 처리 필요
-      shippingCompanyCode: shippingCompany,
-      trackingNumber: trackingNumber,
-    };
+    // 최대 30개씩 배치 처리
+    const batchSize = 30;
+    for (let i = 0; i < productOrderIds.length; i += batchSize) {
+      const batch = productOrderIds.slice(i, i + batchSize);
+      const payload = { productOrderIds: batch };
 
-    const response = await naverPost(url, payload, headers);
-    
-    if (response.code === 'Success' || response.code === '00000000') {
-      console.log(`[배송] 상태 업데이트 성공: ${productOrderIds[0]}`);
-      return { success: true, message: `배송 상태 업데이트 완료 (송장: ${trackingNumber})` };
-    } else {
-      console.error(`[배송] API 오류:`, response.message || response.code);
-      return { success: false, message: `배송 상태 업데이트 실패: ${response.message || response.code}` };
+      try {
+        const response = await naverPost(url, payload, headers);
+        if (response.code === 'Success' || response.code === '00000000' || !response.code) {
+          successIds.push(...batch);
+          console.log(`[발주확인] 성공: ${batch.length}건`);
+        } else {
+          failIds.push(...batch);
+          console.error(`[발주확인] 실패:`, response.message || response.code);
+        }
+      } catch (e: any) {
+        failIds.push(...batch);
+        console.error(`[발주확인] 배치 오류:`, e.response?.data?.message || e.message);
+      }
+
+      if (i + batchSize < productOrderIds.length) {
+        await new Promise(r => setTimeout(r, 500));
+      }
     }
+
+    const success = failIds.length === 0;
+    const message = `발주확인 완료: ${successIds.length}건 성공${failIds.length > 0 ? `, ${failIds.length}건 실패` : ''}`;
+    console.log(`[발주확인] ${message}`);
+    return { success, message, successIds, failIds };
   } catch (error: any) {
     const errMsg = error.response?.data?.message || error.message || String(error);
-    console.error('[배송] 오류:', errMsg);
-    return { success: false, message: `배송 상태 업데이트 오류: ${errMsg}` };
+    console.error('[발주확인] 오류:', errMsg);
+    return { success: false, message: `발주확인 오류: ${errMsg}`, successIds, failIds };
   }
 }
 
 /**
- * 배송 준비 중인 주문 조회
+ * 배송정보 등록 (배송준비 OK → 배송중 DELIVERING)
+ * 네이버 커머스 API: POST /external/v1/product-orders/dispatch
  * @param token 스마트스토어 API 토큰
- * @param fromDate 시작 날짜 (YYYY-MM-DD)
- * @param toDate 종료 날짜 (YYYY-MM-DD)
+ * @param dispatchItems 배송정보 배열 [{productOrderId, deliveryCompanyCode, trackingNumber}]
+ */
+export async function dispatchProductOrders(
+  token: string,
+  dispatchItems: Array<{ productOrderId: string; deliveryCompanyCode: string; trackingNumber: string }>
+): Promise<{ success: boolean; message: string; successIds: string[]; failIds: string[] }> {
+  const successIds: string[] = [];
+  const failIds: string[] = [];
+
+  try {
+    if (!dispatchItems || dispatchItems.length === 0) {
+      return { success: false, message: '배송 정보가 없습니다.', successIds, failIds };
+    }
+
+    console.log(`[배송처리] 시작: ${dispatchItems.length}건`);
+
+    const url = 'https://api.commerce.naver.com/external/v1/product-orders/dispatch';
+    const headers = {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    };
+
+    // 최대 30개씩 배치 처리
+    const batchSize = 30;
+    for (let i = 0; i < dispatchItems.length; i += batchSize) {
+      const batch = dispatchItems.slice(i, i + batchSize);
+      const payload = {
+        dispatchProductOrders: batch.map(item => ({
+          productOrderId: item.productOrderId,
+          deliveryMethod: 'DELIVERY',
+          deliveryCompanyCode: item.deliveryCompanyCode,
+          trackingNumber: item.trackingNumber,
+        }))
+      };
+
+      try {
+        const response = await naverPost(url, payload, headers);
+        if (response.code === 'Success' || response.code === '00000000' || !response.code) {
+          successIds.push(...batch.map(b => b.productOrderId));
+          console.log(`[배송처리] 성공: ${batch.length}건`);
+        } else {
+          failIds.push(...batch.map(b => b.productOrderId));
+          console.error(`[배송처리] 실패:`, response.message || response.code);
+        }
+      } catch (e: any) {
+        failIds.push(...batch.map(b => b.productOrderId));
+        console.error(`[배송처리] 배치 오류:`, e.response?.data?.message || e.message);
+      }
+
+      if (i + batchSize < dispatchItems.length) {
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+
+    const success = failIds.length === 0;
+    const message = `배송처리 완료: ${successIds.length}건 성공${failIds.length > 0 ? `, ${failIds.length}건 실패` : ''}`;
+    console.log(`[배송처리] ${message}`);
+    return { success, message, successIds, failIds };
+  } catch (error: any) {
+    const errMsg = error.response?.data?.message || error.message || String(error);
+    console.error('[배송처리] 오류:', errMsg);
+    return { success: false, message: `배송처리 오류: ${errMsg}`, successIds, failIds };
+  }
+}
+
+/**
+ * 배송 준비 중인 주문 조회 (OK 상태)
+ * @param token 스마트스토어 API 토큰
  */
 export async function getDispatchReadyOrders(
   token: string,
@@ -547,31 +634,60 @@ export async function getDispatchReadyOrders(
   toDate: string
 ): Promise<any[]> {
   try {
-    const orders: any[] = [];
-    const headers = { 'Authorization': `Bearer ${token}` };
-
-    // 최근 14일 순차 조회
-    const startDate = new Date(fromDate);
-    const endDate = new Date(toDate);
-    
-    for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
-      const dateStr = d.toISOString().split('T')[0];
-      const url = `https://api.commerce.naver.com/external/v1/product-orders?searchType=orderDate&startDate=${dateStr}&endDate=${dateStr}&pageSize=100`;
-      
-      const response = await naverGet(url, headers);
-      if (response.code === 'Success' && response.data?.productOrders) {
-        const dispatchReady = response.data.productOrders.filter((o: any) => o.productOrderStatus === 'OK');
-        orders.push(...dispatchReady);
-      }
-      
-      // API 레이트 제한 준수 (초당 2회)
-      await new Promise(r => setTimeout(r, 500));
-    }
-
-    console.log(`[배송] 배송 준비 중인 주문 ${orders.length}건 조회 완료`);
-    return orders;
+    const allOrders = await getOrdersForDateRange(token, fromDate, toDate);
+    const dispatchReady = allOrders.filter((o: any) => o.productOrderStatus === 'OK');
+    console.log(`[배송준비조회] ${dispatchReady.length}건 조회 완료`);
+    return dispatchReady;
   } catch (error: any) {
-    console.error('[배송] 조회 오류:', error.message);
+    console.error('[배송준비조회] 오류:', error.message);
     return [];
   }
+}
+
+/**
+ * 날짜 범위 주문 조회 (내부 헬퍼)
+ */
+async function getOrdersForDateRange(token: string, fromDate: string, toDate: string): Promise<any[]> {
+  const allOrders: any[] = [];
+  const headers = { 'Authorization': `Bearer ${token}` };
+  const startDate = new Date(fromDate);
+  const endDate = new Date(toDate);
+
+  for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+    const dateStr = d.toISOString().split('T')[0];
+    try {
+      const url = `https://api.commerce.naver.com/external/v1/product-orders?rangeType=PAYED_DATETIME&startDate=${dateStr}T00:00:00.000Z&endDate=${dateStr}T23:59:59.999Z&pageSize=100`;
+      const response = await naverGet(url, headers);
+      if (response.contents && Array.isArray(response.contents)) {
+        for (const item of response.contents) {
+          const po = item.order?.productOrder || item.productOrder || item;
+          const contentPO = item.content?.productOrder || {};
+          const status = contentPO.productOrderStatus || po.productOrderStatus || item.productOrderStatus || 'UNKNOWN';
+          allOrders.push({ ...po, ...contentPO, productOrderStatus: status });
+        }
+      }
+    } catch (e: any) {
+      console.error(`[날짜범위조회] ${dateStr} 오류:`, e.message);
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return allOrders;
+}
+
+/**
+ * @deprecated updateOrderShippingStatus 대신 dispatchProductOrders 사용
+ */
+export async function updateOrderShippingStatus(
+  token: string,
+  productOrderIds: string[],
+  shippingCompany: string,
+  trackingNumber: string
+): Promise<{ success: boolean; message: string }> {
+  const items = productOrderIds.map(id => ({
+    productOrderId: id,
+    deliveryCompanyCode: shippingCompany,
+    trackingNumber,
+  }));
+  const result = await dispatchProductOrders(token, items);
+  return { success: result.success, message: result.message };
 }

@@ -19,6 +19,8 @@ import {
   getDailySettlement,
   updateOrderShippingStatus,
   getDispatchReadyOrders,
+  confirmProductOrders,
+  dispatchProductOrders,
 } from './smartstore-scheduler';
 import {
   writeSettlementToGoogleSheet,
@@ -348,7 +350,68 @@ app.post('/telegram-webhook', async (req, res) => {
         }
       }
 
-      // ── 배송 처리 ──
+      // ── 발주확인 처리 (PAYED → OK) ──
+      else if (data.startsWith('confirm_order_')) {
+        const dateStr = data.replace('confirm_order_', '');
+        await answerCallbackQuery(query.id, '발주확인 중...');
+        broadcastEvent({ type: 'node_active', node: 'brain', message: '발주확인 시작: ' + dateStr, progress: 10, flow: ['commander->brain'] });
+        await sendTelegram('⏳ 발주확인 중...');
+        try {
+          const token = await getSmartStoreToken();
+          if (!token) { await sendTelegram('❌ 스마트스토어 인증 실패'); return; }
+          // PAYED 상태 주문 조회
+          const newOrders = await getNewOrderDetails(token, dateStr);
+          if (!newOrders || newOrders.length === 0) {
+            await sendTelegram('📭 발주확인할 신규 주문이 없습니다.');
+            return;
+          }
+          const orderIds = newOrders.map((o: any) => o.productOrderId).filter(Boolean);
+          const result = await confirmProductOrders(token, orderIds);
+          broadcastEvent({ type: 'node_complete', node: 'smartstore', message: result.message, progress: 100 });
+          if (result.success) {
+            await sendTelegram(
+              '✅ <b>발주확인 완료</b>\n' +
+              '━━━━━━━━━━━━━━━\n' +
+              '📅 날짜: ' + dateStr + '\n' +
+              '✅ 성공: <b>' + result.successIds.length + '건</b>\n' +
+              '━━━━━━━━━━━━━━━\n' +
+              '📦 배송준비 상태로 변경되었습니다.'
+            );
+          } else {
+            await sendTelegram(
+              '⚠️ <b>발주확인 부분 실패</b>\n' +
+              '━━━━━━━━━━━━━━━\n' +
+              '✅ 성공: ' + result.successIds.length + '건\n' +
+              '❌ 실패: ' + result.failIds.length + '건\n' +
+              result.message
+            );
+          }
+        } catch (e) {
+          broadcastEvent({ type: 'node_error', node: 'brain', message: '발주확인 오류: ' + String(e) });
+          await sendTelegram('❌ 발주확인 오류\n' + String(e));
+        }
+      }
+
+      // ── 배송처리 시작 (송장번호 입력 요청) ──
+      else if (data.startsWith('start_shipping_')) {
+        const dateStr = data.replace('start_shipping_', '');
+        await answerCallbackQuery(query.id, '송장번호 입력 요청');
+        // 송장번호 입력 대기 상태 저장
+        (global as any).__pendingShipping = { dateStr };
+        await sendTelegram(
+          '🚚 <b>배송처리 - 송장번호 입력</b>\n' +
+          '━━━━━━━━━━━━━━━\n' +
+          '📅 날짜: ' + dateStr + '\n' +
+          '\n송장번호를 입력해주세요.\n' +
+          '형식: <code>택배사 송장번호</code>\n' +
+          '예시: <code>로젠 1234567890</code>\n' +
+          '예시: <code>롯데 9876543210</code>\n' +
+          '━━━━━━━━━━━━━━━\n' +
+          '지원 택배사: 로젠, 롯데, CJ, 한진, 우체국'
+        );
+      }
+
+      // ── 배송 처리 (기존 코드 유지) ──
       else if (data.startsWith('confirm_shipping_')) {
         const dateStr = data.replace('confirm_shipping_', '');
         await answerCallbackQuery(query.id, '배송 처리 중...');
@@ -632,6 +695,86 @@ app.post('/telegram-webhook', async (req, res) => {
       }
 
       console.log('[Webhook] 메시지:', text, 'from chat_id:', chatId);
+
+      // ── 송장번호 입력 대기 상태 확인 ──
+      const pendingShipping = (global as any).__pendingShipping;
+      if (pendingShipping && text && !text.startsWith('/')) {
+        // 송장번호 파싱: "택배사 송장번호" 형식
+        const CARRIER_MAP: Record<string, string> = {
+          '로젠': 'LOGEN', '로젠택배': 'LOGEN',
+          '롯데': 'LOTTE', '롯데택배': 'LOTTE', '롯데택배서비스': 'LOTTE',
+          'CJ': 'CJ_LOGISTICS', 'CJ대한': 'CJ_LOGISTICS', 'CJ택배': 'CJ_LOGISTICS',
+          '한진': 'HANJIN', '한진택배': 'HANJIN',
+          '우체국': 'EPOST', '우체국택배': 'EPOST',
+        };
+        const parts = text.trim().split(/\s+/);
+        let carrierCode = '';
+        let trackingNumber = '';
+        if (parts.length >= 2) {
+          const carrierKey = parts[0];
+          carrierCode = CARRIER_MAP[carrierKey] || carrierKey;
+          trackingNumber = parts[1];
+        } else if (parts.length === 1 && /^\d{10,14}$/.test(parts[0])) {
+          // 숫자만 입력 시 로젠 기본 적용
+          carrierCode = 'LOGEN';
+          trackingNumber = parts[0];
+        }
+
+        if (carrierCode && trackingNumber) {
+          (global as any).__pendingShipping = null;
+          broadcastEvent({ type: 'node_active', node: 'brain', message: '배송처리 시작: ' + trackingNumber, progress: 10, flow: ['commander->brain'] });
+          await sendTelegram('⏳ 배송처리 중...');
+          try {
+            const token = await getSmartStoreToken();
+            if (!token) { await sendTelegram('❌ 스마트스토어 인증 실패'); return res.sendStatus(200); }
+            const readyOrders = await getDispatchReadyOrders(token, pendingShipping.dateStr, pendingShipping.dateStr);
+            if (readyOrders.length === 0) {
+              await sendTelegram('📭 배송 준비 중인 주문이 없습니다.');
+              return res.sendStatus(200);
+            }
+            const dispatchItems = readyOrders.map((o: any) => ({
+              productOrderId: o.productOrderId,
+              deliveryCompanyCode: carrierCode,
+              trackingNumber: trackingNumber,
+            }));
+            const result = await dispatchProductOrders(token, dispatchItems);
+            broadcastEvent({ type: 'node_complete', node: 'smartstore', message: result.message, progress: 100 });
+            if (result.success) {
+              await sendTelegram(
+                '✅ <b>배송처리 완료</b>\n' +
+                '━━━━━━━━━━━━━━━\n' +
+                '🚚 택배사: ' + parts[0] + '\n' +
+                '📋 송장번호: <code>' + trackingNumber + '</code>\n' +
+                '✅ 처리: <b>' + result.successIds.length + '건</b>\n' +
+                '━━━━━━━━━━━━━━━\n' +
+                '🚚 배송중 상태로 변경되었습니다.'
+              );
+            } else {
+              await sendTelegram(
+                '⚠️ <b>배송처리 부분 실패</b>\n' +
+                '━━━━━━━━━━━━━━━\n' +
+                '✅ 성공: ' + result.successIds.length + '건\n' +
+                '❌ 실패: ' + result.failIds.length + '건\n' +
+                result.message
+              );
+            }
+          } catch (e) {
+            broadcastEvent({ type: 'node_error', node: 'brain', message: '배송처리 오류: ' + String(e) });
+            await sendTelegram('❌ 배송처리 오류\n' + String(e));
+          }
+          return res.sendStatus(200);
+        } else {
+          // 형식이 맞지 않으면 다시 안내
+          await sendTelegram(
+            '⚠️ 송장번호 형식이 맞지 않습니다.\n' +
+            '형식: <code>택배사 송장번호</code>\n' +
+            '예시: <code>로젠 1234567890</code>\n' +
+            '예시: <code>롯데 9876543210</code>\n' +
+            '또는 /cancel 입력으로 취소'
+          );
+          return res.sendStatus(200);
+        }
+      }
 
       // KST 날짜 헬퍼
       const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
