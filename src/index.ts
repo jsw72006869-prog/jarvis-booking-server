@@ -400,14 +400,22 @@ app.post('/telegram-webhook', async (req, res) => {
 
       // ── 배송처리 시작 (송장번호 입력 요청) ──
       else if (data.startsWith('start_shipping_')) {
-        const dateStr = data.replace('start_shipping_', '');
+        const rawDateStr = data.replace('start_shipping_', '');
+        // 날짜 범위 파싱: 'fromDate_to_toDate' 또는 단일 날짜
+        let fromDateStr: string, toDateStr: string;
+        if (rawDateStr.includes('_to_')) {
+          [fromDateStr, toDateStr] = rawDateStr.split('_to_');
+        } else {
+          fromDateStr = rawDateStr;
+          toDateStr = rawDateStr;
+        }
         await answerCallbackQuery(query.id, '송장번호 입력 요청');
-        // 송장번호 입력 대기 상태 저장
-        (global as any).__pendingShipping = { dateStr };
+        // 송장번호 입력 대기 상태 저장 (날짜 범위 포함)
+        (global as any).__pendingShipping = { dateStr: fromDateStr, fromDate: fromDateStr, toDate: toDateStr };
         await sendTelegram(
           '🚚 <b>배송처리 - 송장번호 입력</b>\n' +
           '━━━━━━━━━━━━━━━\n' +
-          '📅 날짜: ' + dateStr + '\n' +
+          '📅 날짜: ' + fromDateStr + ' ~ ' + toDateStr + '\n' +
           '\n송장번호를 입력해주세요.\n' +
           '형식: <code>택배사 송장번호</code>\n' +
           '예시: <code>로젠 1234567890</code>\n' +
@@ -733,7 +741,10 @@ app.post('/telegram-webhook', async (req, res) => {
           try {
             const token = await getSmartStoreToken();
             if (!token) { await sendTelegram('❌ 스마트스토어 인증 실패'); return res.sendStatus(200); }
-            const readyOrders = await getDispatchReadyOrders(token, pendingShipping.dateStr, pendingShipping.dateStr);
+            // fromDate ~ toDate 범위로 OK 상태 주문 조회
+            const fromD = pendingShipping.fromDate || pendingShipping.dateStr;
+            const toD = pendingShipping.toDate || pendingShipping.dateStr;
+            const readyOrders = await getDispatchReadyOrders(token, fromD, toD);
             if (readyOrders.length === 0) {
               await sendTelegram('📭 배송 준비 중인 주문이 없습니다.');
               return res.sendStatus(200);
