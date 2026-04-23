@@ -641,7 +641,7 @@ export async function confirmProductOrders(
 
     console.log(`[발주확인] 처리 시작: ${productOrderIds.length}건`);
 
-    const url = 'https://api.commerce.naver.com/external/v1/product-orders/confirm';
+    const url = 'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/confirm';
     const headers = {
       'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
@@ -703,7 +703,7 @@ export async function dispatchProductOrders(
 
     console.log(`[배송처리] 시작: ${dispatchItems.length}건`);
 
-    const url = 'https://api.commerce.naver.com/external/v1/product-orders/dispatch';
+    const url = 'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/dispatch';
     const headers = {
       'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
